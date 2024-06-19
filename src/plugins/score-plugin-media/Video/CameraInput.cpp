@@ -38,6 +38,12 @@ bool CameraInput::load(
 {
   close_file();
   m_inputKind = inputKind;
+  if(auto it = m_inputKind.find(','); it != std::string::npos)
+    m_inputKind.erase(it);
+  if(auto it = m_inputKind.find(' '); it != std::string::npos)
+    m_inputKind.erase(it);
+  if(auto it = m_inputKind.find(':'); it != std::string::npos)
+    m_inputKind.erase(it);
   m_inputDevice = inputDevice;
 
   this->width = w;
@@ -70,7 +76,11 @@ bool CameraInput::start() noexcept
   if(auto codec_name = avcodec_get_name(this->m_requestedCodec))
     av_dict_set(&options, "input_format", codec_name, 0);
 
-  // FIXME support pixel format choosing
+  if(m_requestedPixfmt != -1)
+  {
+    if(auto name = av_get_pix_fmt_name(m_requestedPixfmt))
+      av_dict_set(&options, "pixel_format", name, 0);
+  }
 
   if(fps > 0.)
     av_dict_set(&options, "framerate", std::to_string(fps).c_str(), 0);

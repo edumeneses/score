@@ -61,6 +61,11 @@ DeviceDocumentPlugin::DeviceDocumentPlugin(
 
 DeviceDocumentPlugin::~DeviceDocumentPlugin()
 {
+  for(auto dev : this->m_list.devices())
+  {
+    dev->disconnect();
+  }
+
   m_processMessages = false;
   m_asioContext->context.stop();
 
@@ -218,7 +223,8 @@ DeviceDocumentPlugin::loadDeviceFromNode(const Device::Node& node)
     // Instantiate a real device.
     auto& fact = m_context.app.interfaces<Device::ProtocolFactoryList>();
     auto proto = fact.get(node.get<Device::DeviceSettings>().protocol);
-    SCORE_ASSERT(proto);
+    if(!proto)
+      throw std::runtime_error("Null protocol");
     Device::DeviceInterface* newdev
         = proto->makeDevice(node.get<Device::DeviceSettings>(), *this, context());
 
@@ -324,7 +330,9 @@ void DeviceDocumentPlugin::setupConnections(
   {
     vec.push_back(
         con(device, &Device::DeviceInterface::pathAdded, this,
-            [&](const State::Address& addr) {
+            [&, ptr = QPointer{&device}](const State::Address& addr) {
+      if(!ptr)
+        return;
       // FIXME A subtle bug is introduced if we want to add the root
       // node...
       if(addr.path.size() > 0)
@@ -348,7 +356,7 @@ void DeviceDocumentPlugin::setupConnections(
           }
         }
       }
-        }));
+    }, Qt::QueuedConnection));
 
     vec.push_back(con(
         device, &Device::DeviceInterface::pathRemoved, this,

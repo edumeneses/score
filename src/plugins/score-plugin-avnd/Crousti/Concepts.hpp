@@ -285,15 +285,29 @@ auto make_control_in(avnd::field_index<N>, Id<Process::Port>&& id, QObject* pare
   }
   else if constexpr(widg.widget == avnd::widget_type::lineedit)
   {
-    constexpr auto c = avnd::get_range<T>();
-    if constexpr(avnd::program_parameter<T>)
+    if constexpr(avnd::has_range<T>)
     {
-      auto p = new Process::ProgramEdit{c.init.data(), qname, id, parent};
-      p->language = T::language();
-      return p;
+      constexpr auto c = avnd::get_range<T>();
+      if constexpr(avnd::program_parameter<T>)
+      {
+        auto p = new Process::ProgramEdit{c.init.data(), qname, id, parent};
+        p->language = T::language();
+        return p;
+      }
+      else
+        return new Process::LineEdit{c.init.data(), qname, id, parent};
     }
     else
-      return new Process::LineEdit{c.init.data(), qname, id, parent};
+    {
+      if constexpr(avnd::program_parameter<T>)
+      {
+        auto p = new Process::ProgramEdit{"", qname, id, parent};
+        p->language = T::language();
+        return p;
+      }
+      else
+        return new Process::LineEdit{"", qname, id, parent};
+    }
   }
   else if constexpr(widg.widget == avnd::widget_type::combobox)
   {
@@ -364,6 +378,7 @@ auto make_control_in(avnd::field_index<N>, Id<Process::Port>&& id, QObject* pare
   }
   else if constexpr(widg.widget == avnd::widget_type::xy_spinbox)
   {
+    using data_type = std::decay_t<decltype(value_type{}.x)>;
     constexpr auto c = avnd::get_range<T>();
     if constexpr(requires {
                    c.min == 0.f;
@@ -372,14 +387,22 @@ auto make_control_in(avnd::field_index<N>, Id<Process::Port>&& id, QObject* pare
                  })
     {
       return new Process::XYSpinboxes{
-          {c.min, c.min}, {c.max, c.max}, {c.init, c.init}, qname, id, parent};
+          {c.min, c.min},
+          {c.max, c.max},
+          {c.init, c.init},
+          std::is_integral_v<data_type>,
+          qname,
+          id,
+          parent};
     }
     else
     {
       auto [mx, my] = c.min;
       auto [Mx, My] = c.max;
       auto [ix, iy] = c.init;
-      return new Process::XYSpinboxes{{mx, my}, {Mx, My}, {ix, iy}, qname, id, parent};
+      return new Process::XYSpinboxes{
+          {mx, my}, {Mx, My}, {ix, iy}, std::is_integral_v<data_type>,
+          qname,    id,       parent};
     }
   }
   else if constexpr(widg.widget == avnd::widget_type::xyz_spinbox)

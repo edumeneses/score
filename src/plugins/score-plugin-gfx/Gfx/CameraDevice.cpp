@@ -1,9 +1,14 @@
 #include "CameraDevice.hpp"
 
+#include <Gfx/Graph/VideoNode.hpp>
+#include <Video/CameraInput.hpp>
+
 #include <State/MessageListSerialization.hpp>
 #include <State/Widgets/AddressFragmentLineEdit.hpp>
 
+#include <Gfx/CameraDeviceEnumerator.hpp>
 #include <Gfx/GfxApplicationPlugin.hpp>
+#include <Media/LibavIntrospection.hpp>
 
 #include <score/serialization/MimeVisitor.hpp>
 
@@ -65,15 +70,40 @@ bool CameraDevice::reconnect()
 class CameraEnumerator : public Device::DeviceEnumerator
 {
 public:
-  void enumerate(std::function<void(const Device::DeviceSettings&)> f) const override
+  void enumerate(std::function<void(const QString&, const Device::DeviceSettings&)> f)
+      const override
   {
     enumerateCameraDevices([&](const CameraSettings& set, QString name) {
       Device::DeviceSettings s;
       s.name = name;
       s.protocol = CameraProtocolFactory::static_concreteKey();
       s.deviceSpecificSettings = QVariant::fromValue(set);
-      f(s);
+      f(name, s);
     });
+  }
+};
+
+class CustomCameraEnumerator : public Device::DeviceEnumerator
+{
+public:
+  void enumerate(std::function<void(const QString&, const Device::DeviceSettings&)> f)
+      const override
+  {
+    CameraSettings set;
+    set.input = "";
+    set.device = "";
+    set.size = {};
+    set.fps = {};
+
+    set.codec = 0;
+    set.pixelformat = -1;
+    set.custom = true;
+
+    Device::DeviceSettings s;
+    s.name = "Custom";
+    s.protocol = CameraProtocolFactory::static_concreteKey();
+    s.deviceSpecificSettings = QVariant::fromValue(set);
+    f(s.name, s);
   }
 };
 
@@ -90,7 +120,15 @@ QString CameraProtocolFactory::category() const noexcept
 Device::DeviceEnumerators
 CameraProtocolFactory::getEnumerators(const score::DocumentContext& ctx) const
 {
-  return {{"Streams", new CameraEnumerator}};
+  Device::DeviceEnumerators enums;
+#if !defined(__linux__) && !defined(__APPLE__)
+  enums.push_back({"Cameras", new CameraEnumerator});
+#else
+  auto devices = Gfx::make_camera_enumerator();
+  devices->registerAllEnumerators(enums);
+#endif
+  enums.push_back({"Custom", new CustomCameraEnumerator});
+  return enums;
 }
 
 Device::DeviceInterface* CameraProtocolFactory::makeDevice(
@@ -127,11 +165,6 @@ Device::AddressDialog* CameraProtocolFactory::makeEditAddressDialog(
   return nullptr;
 }
 
-Device::ProtocolSettingsWidget* CameraProtocolFactory::makeSettingsWidget()
-{
-  return new CameraSettingsWidget;
-}
-
 QVariant
 CameraProtocolFactory::makeProtocolSpecificSettings(const VisitorVariant& visitor) const
 {
@@ -150,15 +183,63 @@ bool CameraProtocolFactory::checkCompatibility(
   return a.name != b.name;
 }
 
+class CameraSettingsWidget final : public Device::ProtocolSettingsWidget
+{
+public:
+  explicit CameraSettingsWidget(QWidget* parent = nullptr);
+
+  Device::DeviceSettings getSettings() const override;
+  void setSettings(const Device::DeviceSettings& settings) override;
+
+private:
+  void setDefaults();
+  QLineEdit* m_deviceNameEdit{};
+  QLineEdit* m_device{};
+  QComboBox* m_input{};
+
+  QFormLayout* m_layout{};
+
+  Device::DeviceSettings m_settings;
+};
+
+Device::ProtocolSettingsWidget* CameraProtocolFactory::makeSettingsWidget()
+{
+  return new CameraSettingsWidget;
+}
+
 CameraSettingsWidget::CameraSettingsWidget(QWidget* parent)
     : ProtocolSettingsWidget(parent)
 {
   m_deviceNameEdit = new State::AddressFragmentLineEdit{this};
   checkForChanges(m_deviceNameEdit);
 
-  auto layout = new QFormLayout;
-  layout->addRow(tr("Device Name"), m_deviceNameEdit);
-  setLayout(layout);
+  m_device = new QLineEdit{this};
+  m_input = new QComboBox{this};
+
+  m_layout = new QFormLayout;
+  m_layout->addRow(tr("Device Name"), m_deviceNameEdit);
+  m_layout->addRow(tr("Device"), m_device);
+  m_layout->addRow(tr("Input"), m_input);
+
+#if QT_VERSION > QT_VERSION_CHECK(6, 4, 0)
+  m_layout->setRowVisible(1, false);
+  m_layout->setRowVisible(2, false);
+#endif
+
+  const auto& info = LibavIntrospection::instance();
+  for(auto& demux : info.demuxers)
+  {
+    QString name = demux.format->name;
+    if(demux.format->long_name && strlen(demux.format->long_name) > 0)
+    {
+      name += " (";
+      name += demux.format->long_name;
+      name += ")";
+    }
+    m_input->addItem(name, QVariant::fromValue((void*)demux.format));
+  }
+
+  setLayout(m_layout);
 
   setDefaults();
 }
@@ -173,6 +254,13 @@ Device::DeviceSettings CameraSettingsWidget::getSettings() const
   Device::DeviceSettings s = m_settings;
   s.name = m_deviceNameEdit->text();
   s.protocol = CameraProtocolFactory::static_concreteKey();
+  CameraSettings specif = s.deviceSpecificSettings.value<CameraSettings>();
+  if(specif.custom)
+  {
+    specif.device = m_device->text();
+    specif.input = m_input->currentText();
+  }
+  s.deviceSpecificSettings = QVariant::fromValue(std::move(specif));
   return s;
 }
 
@@ -191,6 +279,14 @@ void CameraSettingsWidget::setSettings(const Device::DeviceSettings& settings)
     ossia::net::sanitize_device_name(prettyName);
   }
   m_deviceNameEdit->setText(prettyName);
+
+  const CameraSettings& set = settings.deviceSpecificSettings.value<CameraSettings>();
+  m_device->setText(set.device);
+
+#if QT_VERSION > QT_VERSION_CHECK(6, 4, 0)
+  m_layout->setRowVisible(1, set.custom);
+  m_layout->setRowVisible(2, set.custom);
+#endif
 }
 
 }
@@ -199,7 +295,7 @@ template <>
 void DataStreamReader::read(const Gfx::CameraSettings& n)
 {
   m_stream << n.input << n.device << n.size.width() << n.size.height() << n.fps
-           << n.codec << n.pixelformat;
+           << n.codec << n.pixelformat << n.custom;
   insertDelimiter();
 }
 
@@ -207,7 +303,7 @@ template <>
 void DataStreamWriter::write(Gfx::CameraSettings& n)
 {
   m_stream >> n.input >> n.device >> n.size.rwidth() >> n.size.rheight() >> n.fps
-      >> n.codec >> n.pixelformat;
+      >> n.codec >> n.pixelformat >> n.custom;
   checkDelimiter();
 }
 
@@ -220,6 +316,7 @@ void JSONReader::read(const Gfx::CameraSettings& n)
   obj["FPS"] = n.fps;
   obj["Codec"] = n.codec;
   obj["PixelFormat"] = n.pixelformat;
+  obj["Custom"] = n.custom;
 }
 
 template <>
@@ -233,4 +330,6 @@ void JSONWriter::write(Gfx::CameraSettings& n)
     n.codec = codec->toInt();
   if(auto format = obj.tryGet("PixelFormat"))
     n.pixelformat = format->toInt();
+  if(auto custom = obj.tryGet("Custom"))
+    n.custom = custom->toBool();
 }

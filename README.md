@@ -4,23 +4,23 @@
 
 [**ossia score**](https://ossia.io) is a ***sequencer*** for audio-visual artists, designed to create ***interactive*** shows.
 
-Sequence **OSC, MIDI, DMX, sound, video** and more, between multiple software and hardware, create ***interactive*** and ***intermedia*** scores and ***script*** with JavaScript, PureData or C++ to customize your score.
+Sequence **OSC, MIDI, DMX, sound, video** and more, between multiple software and hardware. Create ***interactive*** and ***intermedia*** scores, ***script*** and ***live-code*** with JavaScript, [ISF Shaders](https://isf.video), [Faust](https://faust.grame.fr), PureData or C++. Leverage IoT protocols such as CoAP or MQTT, interact with joysticks, Wiimotes, Leapmotions, Web APIs and BLE sensors and integrate programs from a wealth of creative programming languages such as [Structure Synth](https://structuresynth.sourceforge.net/), [Context-Free Art](https://www.contextfreeart.org/) and [Bytebeat](https://dollchan.net/bytebeat/). Load any kind of audio or video format and process visuals through Spout, Syphon, NDI or Shmdata.
 
-Free, open source and runs on desktop, mobile, web and embedded.
+Free, open source and runs on desktop, mobile, web and embedded, down to Raspberry Pi Zero 2.
 
 Read more on [https://ossia.io](https://ossia.io), come ask questions on the [forum](https://forum.ossia.io/c/score) or hang out in our [Discord](https://discord.gg/8Hzm4UduaS) or [Matrix room #ossia_score:gitter.im](https://gitter.im/ossia/score), we will be happy to help you !
 
-### Quick download links: [latest official release](https://github.com/ossia/score/releases/) / [bleeding edge](https://github.com/ossia/score/releases/tag/continuous)
+### Quick download links: [latest official release](https://github.com/ossia/score/releases) / [bleeding edge](https://github.com/ossia/score/releases/tag/continuous)
 
 ![ossia score screenshot](/docs/score.png?raw=true)
 
-## Running score
+## Running ossia score
 
-Releases are available for [Windows, Linux (via AppImage) and Mac OS X](https://github.com/ossia/score/releases/latest).
+Releases are available for [Windows, Linux (via AppImage) and macOS](https://github.com/ossia/score/releases/latest).
 
 * Windows: install and run.
 * macOS: open the `.dmg` and drop `ossia score.app` in Applications.
-* Linux: make executable (right click -> permissions or `chmod +x`) and run the AppImage. 
+* Linux: make executable (right click -> permissions or `chmod +x`) and run the AppImage.
 
 ## Build status
 
@@ -28,17 +28,22 @@ Releases are available for [Windows, Linux (via AppImage) and Mac OS X](https://
 |-----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Official releases                 | [ ![ Azure Pipelines ]( https://img.shields.io/azure-devops/build/ossia/f914424f-63a4-43f7-b424-67c9dc58ae05/2 ) ]( https://dev.azure.com/ossia/libossia/_build?definitionId=2 ) |
 | ArchLinux, SUSE, Fedora           | [![Linux distros](https://github.com/ossia/score/actions/workflows/builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/builds.yaml)                         |
-| macOS (Homebrew)                  | [![macOS](https://github.com/ossia/score/actions/workflows/mac-builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/mac-builds.yaml)                         |
+| macOS (Homebrew (M1 & Intel))     | [![macOS](https://github.com/ossia/score/actions/workflows/mac-builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/mac-builds.yaml)                         |
 | Windows (MSYS2, MSVC 2022)        | [![Windows](https://github.com/ossia/score/actions/workflows/win-builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/win-builds.yaml)                       |
-| Debian (Bullseye, Bookworm)       | [![Debian](https://github.com/ossia/score/actions/workflows/debian-builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/debian-builds.yaml)                  |
-| Ubuntu (Jammy 22.04, Lunar 23.04) | [![Ubuntu](https://github.com/ossia/score/actions/workflows/ubuntu-builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/ubuntu-builds.yaml)                  |
-| Raspberry Pi (Bullseye AArch64)   | [![RPi](https://github.com/ossia/score/actions/workflows/embedded.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/embedded.yaml)                               |
+| Debian (Bookworm, Trixie)         | [![Debian](https://github.com/ossia/score/actions/workflows/debian-builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/debian-builds.yaml)                  |
+| Ubuntu (22.04, 23.04, 24.04)      | [![Ubuntu](https://github.com/ossia/score/actions/workflows/ubuntu-builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/ubuntu-builds.yaml)                  |
+| Raspberry Pi (Bookworm AArch64)   | [![RPi](https://github.com/ossia/score/actions/workflows/embedded.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/embedded.yaml)                               |
+| Nix                               | [![Nix](https://github.com/ossia/score/actions/workflows/nix-builds.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/nix-builds.yaml)                           |
 | WebAssembly                       | [![WASM](https://github.com/ossia/score/actions/workflows/wasm.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/wasm.yaml)                                      |
 | Plug-in templates                 | [![Template check](https://github.com/ossia/score/actions/workflows/templates.yaml/badge.svg)](https://github.com/ossia/score/actions/workflows/templates.yaml)                  |
  
 ossia score uses [CppDepend](https://www.cppdepend.com/) to ensure consistent code quality improvements ; please check it out !
 
 In order to build score, follow the [documentation](https://ossia.io/score-docs/development/build-from-source.html).
+
+## Packaging status
+
+[![Packaging status](https://repology.org/badge/vertical-allrepos/ossia-score.svg?columns=3&header=ossia-score)](https://repology.org/project/ossia-score/versions)
 
 ## Contributing
 

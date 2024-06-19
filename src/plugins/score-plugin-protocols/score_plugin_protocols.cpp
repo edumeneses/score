@@ -22,6 +22,12 @@
 #if defined(OSSIA_PROTOCOL_OSCQUERY)
 #include <Protocols/OSCQuery/OSCQueryProtocolFactory.hpp>
 #endif
+#if defined(OSSIA_PROTOCOL_MQTT5)
+#include <Protocols/MQTT/MQTTProtocolFactory.hpp>
+#endif
+#if defined(OSSIA_PROTOCOL_COAP)
+#include <Protocols/CoAP/CoAPProtocolFactory.hpp>
+#endif
 
 #if defined(OSSIA_PROTOCOL_MIDI)
 #include <Protocols/MIDI/MIDIProtocolFactory.hpp>
@@ -43,9 +49,6 @@
 #endif
 #if defined(OSSIA_PROTOCOL_WIIMOTE)
 #include <Protocols/Wiimote/WiimoteProtocolFactory.hpp>
-#endif
-#if defined(OSSIA_PROTOCOL_LEAPMOTION)
-#include <Protocols/Leapmotion/LeapmotionProtocolFactory.hpp>
 #endif
 #if defined(OSSIA_PROTOCOL_ARTNET)
 #include <Protocols/Artnet/ArtnetProtocolFactory.hpp>
@@ -94,6 +97,14 @@ std::vector<score::InterfaceBase*> score_plugin_protocols::factories(
          ,
          Protocols::MinuitProtocolFactory
 #endif
+#if defined(OSSIA_PROTOCOL_MQTT5)
+         ,
+         Protocols::MQTTProtocolFactory
+#endif
+#if defined(OSSIA_PROTOCOL_COAP)
+         ,
+         Protocols::CoAPProtocolFactory
+#endif
 #if defined(OSSIA_PROTOCOL_OSCQUERY)
          ,
          Protocols::OSCQueryProtocolFactory
@@ -121,10 +132,6 @@ std::vector<score::InterfaceBase*> score_plugin_protocols::factories(
 #if defined(OSSIA_PROTOCOL_JOYSTICK)
          ,
          Protocols::JoystickProtocolFactory
-#endif
-#if defined(OSSIA_PROTOCOL_LEAPMOTION)
-         ,
-         Protocols::LeapmotionProtocolFactory
 #endif
 #if defined(OSSIA_PROTOCOL_WIIMOTE)
          ,

@@ -1,6 +1,8 @@
 #include <Gfx/Graph/Node.hpp>
 #include <Gfx/Graph/NodeRenderer.hpp>
 
+#include <score/tools/Debug.hpp>
+
 #include <ossia/gfx/port_index.hpp>
 #include <ossia/network/value/value.hpp>
 #include <ossia/network/value/value_conversion.hpp>
@@ -325,6 +327,13 @@ void ProcessNode::process(int32_t port, const ossia::mesh_list_ptr& v)
 
 void ProcessNode::process(int32_t port, const ossia::transform3d& v) { }
 
+void ProcessNode::process(
+    int32_t port, const std::function<void(score::gfx::Node&)>& func)
+{
+  SCORE_ASSERT(func);
+  func(*this);
+}
+
 void ProcessNode::process(Message&& msg)
 {
   process(msg.token);
@@ -339,5 +348,36 @@ void ProcessNode::process(Message&& msg)
     p++;
   }
 }
+}
 
+QDebug operator<<(QDebug s, const score::gfx::gfx_input& v)
+{
+  struct
+  {
+    QDebug& s;
+    void operator()(ossia::monostate) { s << "monostate"; }
+    void operator()(const std::function<void(score::gfx::Node&)>) { s << "function"; }
+    void operator()(const ossia::value& v)
+    {
+      s << "value:" << QByteArray::fromStdString(ossia::value_to_pretty_string(v));
+    }
+    void operator()(const ossia::audio_vector& v)
+    {
+      s << "audio: " << v.size() << "channels";
+    }
+    void operator()(const ossia::mesh_list_ptr& v) { s << "meshlist"; }
+    void operator()(const ossia::transform3d& v) { s << "transform3d"; }
+  } print{s};
+  ossia::visit(print, std::move(v));
+  return s;
+}
+QDebug operator<<(QDebug s, const std::vector<score::gfx::gfx_input>& v)
+{
+  s << "[";
+  for(const auto& m : v)
+  {
+    s << m << " ; ";
+  }
+  s << "]";
+  return s;
 }

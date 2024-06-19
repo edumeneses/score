@@ -153,6 +153,11 @@ struct GfxRenderer<Node_T> final : score::gfx::GenericNodeRenderer
 
   void init(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch& res) override
   {
+    if constexpr(requires { state.init(); })
+    {
+      state.init();
+    }
+
     const auto& mesh = renderer.defaultTriangle();
     this->defaultMeshInit(renderer, mesh, res);
     this->processUBOInit(renderer);
@@ -253,20 +258,7 @@ struct GfxRenderer<Node_T> final : score::gfx::GenericNodeRenderer
           });
     }
 
-    // Apply the controls
-    avnd::parameter_input_introspection<Node_T>::for_all_n2(
-        avnd::get_inputs<Node_T>(state),
-        [&](avnd::parameter auto& t, auto pred_index, auto field_index) {
-      auto& mess = this->parent.last_message;
-
-      if(mess.input.size() > field_index)
-      {
-        if(auto val = ossia::get_if<ossia::value>(&mess.input[field_index]))
-        {
-          oscr::from_ossia_value(t, *val, t.value);
-        }
-      }
-        });
+    parent.processControlIn(state, this->parent.last_message);
 
     // Run the processor
     state();
@@ -289,12 +281,13 @@ struct GfxRenderer<Node_T> final : score::gfx::GenericNodeRenderer
   }
 };
 
-
 template <typename Node_T>
   requires(avnd::texture_input_introspection<Node_T>::size > 0
            && avnd::texture_output_introspection<Node_T>::size > 0)
 struct GfxNode<Node_T> final
     : CustomGfxNodeBase
+    , GpuWorker
+    , GpuControlIns
     , GpuControlOuts
 {
   oscr::ProcessModel<Node_T>& processModel;

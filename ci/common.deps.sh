@@ -26,4 +26,20 @@ fi
 if [[ ! -d score-avnd-granola ]]; then
   git clone --recursive -j16 https://github.com/bltzr/score-avnd-granola
 fi
+
+if [[ ! -d score-addon-ultraleap ]]; then
+  git clone --recursive -j16 https://github.com/ossia/score-addon-ultraleap
+fi
+
+if [[ ! -d score-addon-contextfree ]]; then
+  git clone --recursive -j16 https://github.com/ossia/score-addon-contextfree
+fi
+
+if [[ ! -d score-addon-ble ]]; then
+  git clone --recursive -j16 https://github.com/ossia/score-addon-ble
+fi
+
+
 )
+
+

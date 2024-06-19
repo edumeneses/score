@@ -63,6 +63,11 @@ jobs:
         with:
           submodules: 'recursive'
 
+      - name: Dependencies
+        shell: bash
+        run: |
+          ./ci/mingw.deps.sh
+
       - name: Setup msys2 and mingw-w64
         uses: msys2/setup-msys2@v2
         with:
@@ -72,6 +77,7 @@ jobs:
             cmake:p
             ninja:p
             toolchain:p
+            cppwinrt:p
             qt6-base:p
             qt6-declarative:p
             qt6-websockets:p
@@ -85,11 +91,6 @@ jobs:
             fftw:p
             ffmpeg:p
             SDL2:p
-
-      - name: Dependencies
-        shell: msys2 {0}
-        run: |
-          ./ci/mingw.deps.sh
 
       - name: Build
         shell: msys2 {0}
@@ -108,7 +109,7 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v3
         with:
-          version: 6.4.*
+          version: 6.7.*
           modules: qtwebsockets qtserialport qtscxml qtshadertools
 
       - name: Set up Visual Studio shell

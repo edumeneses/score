@@ -5,6 +5,7 @@ source ci/common.setup.sh
 # Disabling libSDL2-devel until -fPIC problem is sorted...
 
 $SUDO zypper -n install \
+   git \
    ninja gcc12 gcc12-c++ \
    llvm-devel \
    libjack-devel alsa-devel \
@@ -13,6 +14,7 @@ $SUDO zypper -n install \
    libavahi-devel \
    fftw3-devel fftw3-threads-devel \
    bluez-devel \
+   dbus-1-devel \
    qt6-base-devel qt6-base-private-devel  \
    qt6-declarative-devel qt6-declarative-private-devel \
    qt6-tools \

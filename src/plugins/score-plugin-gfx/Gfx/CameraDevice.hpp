@@ -1,25 +1,14 @@
 #pragma once
-#include <Gfx/CameraSettings.hpp>
-#include <Gfx/GfxDevice.hpp>
-#include <Gfx/GfxExecContext.hpp>
-#include <Gfx/GfxInputDevice.hpp>
-#include <Gfx/Graph/VideoNode.hpp>
-#include <Video/CameraInput.hpp>
-
-#include <ossia/gfx/texture_parameter.hpp>
-#include <ossia/network/base/device.hpp>
-#include <ossia/network/base/protocol.hpp>
-
-#include <QLineEdit>
-
-class QComboBox;
-
-// Score part
-
 #include <Device/Protocol/DeviceInterface.hpp>
 #include <Device/Protocol/DeviceSettings.hpp>
 #include <Device/Protocol/ProtocolFactoryInterface.hpp>
 #include <Device/Protocol/ProtocolSettingsWidget.hpp>
+
+#include <Gfx/CameraSettings.hpp>
+#include <Gfx/GfxInputDevice.hpp>
+
+class QComboBox;
+class QLineEdit;
 
 namespace Gfx
 {
@@ -69,21 +58,6 @@ private:
   Gfx::video_texture_input_protocol* m_protocol{};
   mutable std::unique_ptr<Gfx::video_texture_input_device> m_dev;
 };
-
-class CameraSettingsWidget final : public Device::ProtocolSettingsWidget
-{
-public:
-  CameraSettingsWidget(QWidget* parent = nullptr);
-
-  Device::DeviceSettings getSettings() const override;
-  void setSettings(const Device::DeviceSettings& settings) override;
-
-private:
-  void setDefaults();
-  QLineEdit* m_deviceNameEdit{};
-  Device::DeviceSettings m_settings;
-};
-
 }
 
 SCORE_SERIALIZE_DATASTREAM_DECLARE(, Gfx::CameraSettings);

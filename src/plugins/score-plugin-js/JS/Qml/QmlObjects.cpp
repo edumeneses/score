@@ -2,6 +2,8 @@
 
 #include <JS/Qml/Metatypes.hpp>
 
+#include <ossia/math/safe_math.hpp>
+
 #include <QVector2D>
 #include <QVector3D>
 #include <QVector4D>
@@ -19,9 +21,19 @@ W_OBJECT_IMPL(JS::AudioOutlet)
 #if defined(SCORE_HAS_GPU_JS)
 W_OBJECT_IMPL(JS::TextureOutlet)
 #endif
-W_OBJECT_IMPL(JS::FloatSlider)
-W_OBJECT_IMPL(JS::IntSlider)
 W_OBJECT_IMPL(JS::Enum)
+W_OBJECT_IMPL(JS::FloatRangeSpinBox)
+W_OBJECT_IMPL(JS::IntRangeSlider)
+W_OBJECT_IMPL(JS::IntRangeSpinBox)
+W_OBJECT_IMPL(JS::HSVSlider)
+W_OBJECT_IMPL(JS::XYSlider)
+W_OBJECT_IMPL(JS::XYZSlider)
+W_OBJECT_IMPL(JS::XYSpinboxes)
+W_OBJECT_IMPL(JS::XYZSpinboxes)
+W_OBJECT_IMPL(JS::MultiSlider)
+W_OBJECT_IMPL(JS::FileChooser)
+W_OBJECT_IMPL(JS::AudioFileChooser)
+W_OBJECT_IMPL(JS::VideoFileChooser)
 W_OBJECT_IMPL(JS::Toggle)
 W_OBJECT_IMPL(JS::Button)
 W_OBJECT_IMPL(JS::Impulse)
@@ -130,8 +142,8 @@ void ValueInlet::setValue(QVariant value)
   if(m_value == value)
     return;
 
-  m_value = value;
-  valueChanged(value);
+  m_value = std::move(value);
+  valueChanged(m_value);
 }
 
 ControlInlet::ControlInlet(QObject* parent)
@@ -141,7 +153,7 @@ ControlInlet::ControlInlet(QObject* parent)
 
 ControlInlet::~ControlInlet() { }
 
-QVariant ControlInlet::value() const
+QVariant ControlInlet::value() const noexcept
 {
   return m_value;
 }
@@ -151,7 +163,7 @@ void ControlInlet::setValue(QVariant value)
   if(m_value == value)
     return;
 
-  m_value = value;
+  m_value = std::move(value);
   valueChanged(m_value);
 }
 
@@ -248,20 +260,27 @@ void AudioOutlet::setChannel(int i, const QJSValue& v)
 
   int n = v.property("length").toNumber();
   auto& arr = m_audio[i];
+  arr.clear();
   arr.resize(n);
   double* data = arr.data();
   for(int s = 0; s < n; s++)
   {
-    data[s] = v.property(s).toNumber();
+    if(const auto& prop = v.property(s); prop.isNumber())
+    {
+      data[s] = prop.toNumber();
+      if(ossia::safe_isinf(data[s]) || ossia::safe_isnan(data[s]))
+        data[s] = 0.;
+    }
+    else
+    {
+      data[s] = 0.;
+    }
   }
 }
 
 Inlet::~Inlet() { }
-
 Outlet::~Outlet() { }
 
-FloatSlider::~FloatSlider() = default;
-IntSlider::~IntSlider() = default;
 Toggle::~Toggle() = default;
 Button::~Button() = default;
 Impulse::~Impulse() = default;

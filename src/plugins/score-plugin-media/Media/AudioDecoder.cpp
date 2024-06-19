@@ -6,6 +6,7 @@
 #include <score/tools/Debug.hpp>
 
 #include <ossia/dataflow/sample_to_float.hpp>
+#include <ossia/detail/libav.hpp>
 #include <ossia/detail/variant.hpp>
 
 #include <QHash>
@@ -250,7 +251,7 @@ decoder_t make_N_decoder(AVStream& stream)
 decoder_t make_dynamic_decoder(AVStream& stream)
 {
   const int size = stream.codecpar->bits_per_raw_sample;
-  const std::size_t channels = stream.codecpar->channels;
+  const std::size_t channels = ossia::avstream_get_audio_channels(stream);
 
   if(size == 0 || size == 8 || size == 16 || size == 32)
   {
@@ -345,7 +346,7 @@ decoder_t make_N_decoder<1>(AVStream& stream)
 
 static decoder_t make_decoder(AVStream& stream)
 {
-  switch(stream.codecpar->channels)
+  switch(ossia::avstream_get_audio_channels(stream))
   {
     case 1:
       return make_N_decoder<1>(stream);
@@ -453,7 +454,7 @@ std::optional<AudioInfo> AudioDecoder::do_probe(const QString& path)
     {
       auto stream = fmt_ctx->streams[i];
       AudioInfo info;
-      info.channels = stream->codecpar->channels;
+      info.channels = ossia::avstream_get_audio_channels(*stream);
       if(info.channels == 0)
         return {};
       info.fileRate = stream->codecpar->sample_rate;
@@ -749,9 +750,20 @@ void AudioDecoder::on_startDecode(QString path, audio_handle hdl)
     {
       for(std::size_t i = 0; i < channels; ++i)
       {
+#if LIBSWRESAMPLE_VERSION_MAJOR <= 4
         SwrContext* swr = swr_alloc_set_opts(
             nullptr, AV_CH_LAYOUT_MONO, AV_SAMPLE_FMT_FLT, convertedSampleRate,
             AV_CH_LAYOUT_MONO, AV_SAMPLE_FMT_FLT, fileSampleRate, 0, nullptr);
+#else
+        SwrContext* swr = nullptr;
+        static constexpr AVChannelLayout mono_layout AV_CHANNEL_LAYOUT_MONO;
+        int ret = swr_alloc_set_opts2(
+            &swr, &mono_layout, AV_SAMPLE_FMT_FLT, convertedSampleRate, &mono_layout,
+            AV_SAMPLE_FMT_FLT, fileSampleRate, 0, nullptr);
+
+        if(ret != 0)
+          throw std::runtime_error("Couldn't open resampler");
+#endif
         swr_init(swr);
         resampler.push_back(swr);
       }

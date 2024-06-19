@@ -26,10 +26,8 @@ jobs:
           ./ci/osx-brew.build.sh
 
   brew-m1:
-    # Disabled until we manage to set-up proper macOS VMs to not pollute host with homebrew
-    if: false
     name: macOS (Release, Brew, AppleSilicon)
-    runs-on: macmini-arm64
+    runs-on: macos-14
     
     steps:
       - name: Checkout code
@@ -46,10 +44,8 @@ jobs:
           ./ci/osx-brew.build.sh
 
   brew-m1-dev:
-    # Disabled until we manage to set-up proper macOS VMs to not pollute host with homebrew
-    if: false
     name: macOS (Dev, Brew, AppleSilicon)
-    runs-on: macmini-arm64
+    runs-on: macos-14
     
     steps:
       - name: Checkout code
@@ -67,8 +63,7 @@ jobs:
 
   m1-package:
     name: macOS (AppleSilicon Release)
-    runs-on: macmini-arm64
-    
+    runs-on: macos-14
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -76,12 +71,22 @@ jobs:
           submodules: 'recursive'
 
       - run: |
-          source ci/common.deps.sh
+          source ci/osx-package.deps.sh
+        env:
+          MACOS_ARCH: "aarch64"
+          MAC_CERT_B64: ${{ secrets.MAC_CERT_B64 }}
+          MAC_CODESIGN_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
 
+      - uses: jcelerier/import-codesign-certs@master
+        with:
+          p12-file-base64: ${{ secrets.MAC_CERT_B64 }}
+          p12-password: ${{ secrets.MAC_CERT_PASSWORD }}
+ 
       - run: |
           source ci/osx-package.build.sh
         env:
           MACOS_ARCH: "aarch64"
+
       - run: |
           export GITTAGNOV=$(echo "$GITHUB_REF" | sed "s/.*\///;s/^v//")
           export BUILD_ARTIFACTSTAGINGDIRECTORY=$PWD/staging

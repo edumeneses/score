@@ -232,6 +232,11 @@ struct GpuComputeRenderer final : ComputeRendererBaseType<Node_T>
 
   void init(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch& res) override
   {
+    if constexpr(requires { state.init(); })
+    {
+      state.init();
+    }
+
     // Create the global shared inputs
     avnd::input_introspection<Node_T>::for_all(
         [this, &renderer](auto f) { init_input(renderer, f); });
@@ -379,20 +384,7 @@ struct GpuComputeRenderer final : ComputeRendererBaseType<Node_T>
     // m_last_time = parent.last_message.token.date;
 
     // Apply the controls
-    {
-      avnd::parameter_input_introspection<Node_T>::for_all_n2(
-          avnd::get_inputs<Node_T>(state),
-          [&](avnd::parameter auto& t, auto pred_index, auto field_index) {
-        auto& mess = this->parent.last_message;
-        if(mess.input.size() > field_index)
-        {
-          if(auto val = ossia::get_if<ossia::value>(&mess.input[field_index]))
-          {
-            oscr::from_ossia_value(t, *val, t.value);
-          }
-        }
-          });
-    }
+    parent.processControlIn(this->state, this->parent.last_message);
 
     // Run the compute shader
     {

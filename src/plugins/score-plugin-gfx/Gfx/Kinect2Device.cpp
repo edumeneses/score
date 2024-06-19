@@ -4,6 +4,7 @@
 #include <State/Widgets/AddressFragmentLineEdit.hpp>
 
 #include <Gfx/GfxApplicationPlugin.hpp>
+#include <Gfx/Graph/VideoNode.hpp>
 
 #include <score/serialization/MimeVisitor.hpp>
 
@@ -498,7 +499,8 @@ namespace Gfx::Kinect2
 class Kinect2Enumerator : public Device::DeviceEnumerator
 {
 public:
-  void enumerate(std::function<void(const Device::DeviceSettings&)> f) const override
+  void enumerate(std::function<void(const QString&, const Device::DeviceSettings&)> f)
+      const override
   {
     auto& freenect2 = Kinect2::Kinect2Context::instance().freenect2;
     const int numDevices = freenect2.enumerateDevices();
@@ -517,7 +519,7 @@ public:
 
       s.protocol = ProtocolFactory::static_concreteKey();
       s.deviceSpecificSettings = QVariant::fromValue(sset);
-      f(s);
+      f(s.name, s);
     }
   }
 };

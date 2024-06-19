@@ -37,7 +37,7 @@ Component::Component(
     this->node = node;
     auto proc = std::make_shared<js_process>(node);
     m_ossia_process = proc;
-    on_scriptChange(element.qmlData(), false);
+    on_scriptChange();
   }
   else
   {
@@ -48,7 +48,7 @@ Component::Component(
 
     m_ossia_process = std::make_shared<ossia::node_process>(node);
 
-    on_scriptChange(element.qmlData(), true);
+    on_scriptChange();
 #else
     throw std::runtime_error(
         "GPU Nodes not supported in this build of score, use a distribution with an "
@@ -56,13 +56,13 @@ Component::Component(
 #endif
   }
 
-  con(element, &JS::ProcessModel::qmlDataChanged, this, &Component::on_scriptChange,
+  con(element, &JS::ProcessModel::programChanged, this, &Component::on_scriptChange,
       Qt::DirectConnection);
 }
 
 Component::~Component() { }
 
-void Component::on_scriptChange(const QString& script, bool gpu)
+void Component::on_scriptChange()
 {
   enum Type
   {
@@ -71,7 +71,7 @@ void Component::on_scriptChange(const QString& script, bool gpu)
     Gpu
   };
   Type cur_type{};
-  Type next_type = gpu ? Gpu : Cpu;
+  Type next_type = process().isGpu() ? Gpu : Cpu;
 
   if(!node)
   {
@@ -95,6 +95,7 @@ void Component::on_scriptChange(const QString& script, bool gpu)
   std::tuple<ossia::inlets, ossia::outlets, std::vector<Execution::ExecutionCommand>>
       new_ports;
 
+  const auto& script = process().qmlData();
   // 1. Recreate ports & change the script
   if(cur_type == next_type)
   {
@@ -148,6 +149,7 @@ Component::on_gpuScriptChange(const QString& script, Execution::Transaction& com
   // 1. Create new inlet & outlet arrays
   ossia::inlets inls;
   ossia::outlets outls;
+  Gfx::exec_controls controls;
   std::vector<Execution::ExecutionCommand> controlSetups;
 
   int inlet_idx = 0;
@@ -155,7 +157,6 @@ Component::on_gpuScriptChange(const QString& script, Execution::Transaction& com
   std::size_t control_index = 0;
   {
     const Execution::Context& ctx = system();
-    std::vector<std::shared_ptr<Gfx::gfx_exec_node::control>> controls;
     if(auto object = process().currentObject())
     {
       for(auto n : object->children())
@@ -181,7 +182,7 @@ Component::on_gpuScriptChange(const QString& script, Execution::Transaction& com
           control_index++;
         }
 
-        else if(auto ctrl_in = qobject_cast<JS::ControlInlet*>(val_in))
+        else if(auto ctrl_in = qobject_cast<JS::ControlInlet*>(inlet))
         {
           auto inletport = new ossia::value_inlet;
           auto control = std::make_shared<Gfx::gfx_exec_node::control>();
@@ -195,12 +196,18 @@ Component::on_gpuScriptChange(const QString& script, Execution::Transaction& com
 
             model_ctrl->setupExecution(*inletport);
             control->value = model_ctrl->value();
+            control->changed = true;
 
             // TODO assert that we aren't going to connect twice
             QObject::disconnect(model_ctrl, nullptr, this, nullptr);
             QObject::connect(
                 model_ctrl, &Process::ControlInlet::valueChanged, this,
                 Gfx::con_unvalidated{ctx, control_index, script_index, weak_node});
+
+            // FIXME initial control state
+            // controlSetups.push_back([/* node, val = ctrl->value(), idx */] {
+            //   // node->setControl(idx, val.apply(ossia::qt::ossia_to_qvariant{}));
+            // });
           }
 
           controls.push_back(control);
@@ -281,7 +288,7 @@ Component::on_gpuScriptChange(const QString& script, Execution::Transaction& com
         }
 */
 
-        if(auto tex_out = qobject_cast<TextureOutlet*>(outlet))
+        else if(auto tex_out = qobject_cast<TextureOutlet*>(outlet))
         {
           outls.push_back(new ossia::texture_outlet);
         }
@@ -297,7 +304,8 @@ Component::on_gpuScriptChange(const QString& script, Execution::Transaction& com
   // Send the updates to the node
   auto recable = std::shared_ptr<ossia::recabler>(
       new ossia::recabler{node, system().execGraph, inls, outls});
-  commands.push_back([node, script, recable]() mutable {
+  commands.push_back([node, script, controls, recable]() mutable {
+    using namespace std;
     // Note: we need to do this because we try to keep the Javascript node around
     // because it's slow to recreate.
     // But this causes a lot of problems, it'd be better to do like e.g. the faust
@@ -305,6 +313,8 @@ Component::on_gpuScriptChange(const QString& script, Execution::Transaction& com
     (*recable)();
 
     node->setScript(std::move(script));
+
+    swap(node->controls, controls);
   });
 
   SCORE_ASSERT(process().inlets().size() == inls.size());
@@ -330,12 +340,47 @@ Component::on_cpuScriptChange(const QString& script, Execution::Transaction& com
     if(auto object = process().currentObject())
     {
       int idx = 0;
+      auto process_if_control
+          = [this, &node, &controlSetups](ossia::value_port& vp, int idx) {
+        if(auto ctrl = qobject_cast<Process::ControlInlet*>(process().inlets()[idx]))
+        {
+          vp.type = ctrl->value().get_type();
+          vp.domain = ctrl->domain().get();
+
+          disconnect(ctrl, nullptr, this, nullptr);
+          if(auto impulse = qobject_cast<Process::ImpulseButton*>(ctrl))
+          {
+            connect(
+                ctrl, &Process::ControlInlet::valueChanged, this,
+                [this, node, idx](const ossia::value& val) {
+              this->in_exec([node, idx] { node->impulse(idx); });
+            });
+          }
+          else
+          {
+            // Common case
+            connect(
+                ctrl, &Process::ControlInlet::valueChanged, this,
+                [this, node, idx](const ossia::value& val) {
+              this->in_exec([node, val, idx] {
+                node->setControl(idx, val.apply(ossia::qt::ossia_to_qvariant{}));
+              });
+            });
+            controlSetups.push_back([node, val = ctrl->value(), idx] {
+              node->setControl(idx, val.apply(ossia::qt::ossia_to_qvariant{}));
+            });
+          }
+        }
+      };
       for(auto n : object->children())
       {
         if(auto ctrl_in = qobject_cast<ControlInlet*>(n))
         {
           inls.push_back(new ossia::value_inlet);
-          inls.back()->target<ossia::value_port>()->is_event = false;
+          auto& vp = *inls.back()->target<ossia::value_port>();
+          vp.is_event = false;
+
+          process_if_control(vp, idx);
 
           ++idx;
         }
@@ -343,37 +388,9 @@ Component::on_cpuScriptChange(const QString& script, Execution::Transaction& com
         {
           inls.push_back(new ossia::value_inlet);
           auto& vp = *inls.back()->target<ossia::value_port>();
-
           vp.is_event = !val_in->isEvent();
-          if(auto ctrl = qobject_cast<Process::ControlInlet*>(process().inlets()[idx]))
-          {
-            vp.type = ctrl->value().get_type();
-            vp.domain = ctrl->domain().get();
 
-            disconnect(ctrl, nullptr, this, nullptr);
-            if(auto impulse = qobject_cast<Process::ImpulseButton*>(ctrl))
-            {
-              connect(
-                  ctrl, &Process::ControlInlet::valueChanged, this,
-                  [this, node, idx](const ossia::value& val) {
-                this->in_exec([node, idx] { node->impulse(idx); });
-                  });
-            }
-            else
-            {
-              // Common case
-              connect(
-                  ctrl, &Process::ControlInlet::valueChanged, this,
-                  [this, node, idx](const ossia::value& val) {
-                this->in_exec([node, val, idx] {
-                  node->setControl(idx, val.apply(ossia::qt::ossia_to_qvariant{}));
-                });
-                  });
-              controlSetups.push_back([node, val = ctrl->value(), idx] {
-                node->setControl(idx, val.apply(ossia::qt::ossia_to_qvariant{}));
-              });
-            }
-          }
+          process_if_control(vp, idx);
 
           ++idx;
         }

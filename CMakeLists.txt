@@ -98,17 +98,17 @@ if(SCORE_MACOS_ONLY_SYSTEM_LIBARIES)
   endforeach()
 endif()
 
-set(CMAKE_SYSTEM_PREFIX_PATH "${CMAKE_SYSTEM_PREFIX_PATH}" CACHE INTERNAL "" FORCE)
-set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}" CACHE INTERNAL "" FORCE)
+# set(CMAKE_SYSTEM_PREFIX_PATH "${CMAKE_SYSTEM_PREFIX_PATH}" CACHE INTERNAL "" FORCE)
+# set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH}" CACHE INTERNAL "" FORCE)
 
 # QT_PREFIX: Qt5 / Qt6
 list(GET QT_VERSION 0 QT_PREFIX)
 
 set(SCORE_VERSION_MAJOR 3)
-set(SCORE_VERSION_MINOR 1)
-set(SCORE_VERSION_PATCH 13)
+set(SCORE_VERSION_MINOR 2)
+set(SCORE_VERSION_PATCH 1)
 set(SCORE_VERSION_EXTRA "")
-set(SCORE_CODENAME "Tamaulipas")
+set(SCORE_CODENAME "Samarcande")
 
 set(SCORE_VERSION "${SCORE_VERSION_MAJOR}.${SCORE_VERSION_MINOR}.${SCORE_VERSION_PATCH}")
 
@@ -188,9 +188,11 @@ find_package(${QT_VERSION} REQUIRED
                Network
                Xml
                StateMachine
+               OpenGL
                OpenGLWidgets
                Qml
-               ShaderTools
+               ShaderTools Quick QmlModels
+             OPTIONAL_COMPONENTS WebSockets Svg
 )
 
 if(EMSCRIPTEN)

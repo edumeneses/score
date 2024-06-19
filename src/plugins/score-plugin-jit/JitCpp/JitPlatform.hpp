@@ -143,7 +143,7 @@ populateCompileOptions(std::vector<std::string>& args, CompilerOptions opts)
     }
   }
 
-  args.push_back("-std=c++20");
+  args.push_back("-std=c++2b");
   args.push_back("-disable-free");
   args.push_back("-fdeprecated-macro");
   args.push_back("-fmath-errno");
@@ -205,7 +205,7 @@ populateCompileOptions(std::vector<std::string>& args, CompilerOptions opts)
 
   // // tls:
   args.push_back("-ftls-model=local-exec");
-  args.push_back("-fno-emulated-tls");
+  // args.push_back("-fno-emulated-tls");
 
   // if fsanitize:
   args.push_back("-mrelax-all");
@@ -233,7 +233,7 @@ populateCompileOptions(std::vector<std::string>& args, CompilerOptions opts)
   */
 #endif
   args.push_back("-fno-assume-sane-operator-new");
-  args.push_back("-fcoroutines-ts");
+  // args.push_back("-fcoroutines-ts");
   args.push_back("-stack-protector");
   args.push_back("0");
   if(opts.NoExceptions)
@@ -370,6 +370,7 @@ static inline auto getPotentialTriples()
   triples.push_back("aarch64-pc-linux-gnueabi");
   triples.push_back("aarch64-none-linux-gnu");
   triples.push_back("aarch64-pc-linux-gnu");
+  triples.push_back("aarch64-redhat-linux");
 #endif
 
   return triples;

@@ -117,6 +117,7 @@ add_library(
 
 
   Avnd/Factories.hpp
+  AvndDevices/AvndDevice.hpp
 
   Crousti/Attributes.hpp
   Crousti/Concepts.hpp
@@ -270,7 +271,8 @@ target_link_libraries(score_plugin_avnd
 if(TARGET kfr_dft)
   target_link_libraries(score_plugin_avnd PRIVATE
     "$<BUILD_INTERFACE:kfr>"
-    "$<BUILD_INTERFACE:kfr_dft>"
+    "$<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,kfr_dft>>"
+    "$<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,kfr_dsp>>"
   )
 endif()
 if(TARGET score_plugin_gfx)
@@ -319,7 +321,7 @@ set(AVND_ADDITIONAL_CLASSES)
 set(AVND_CUSTOM_FACTORIES)
 function(avnd_make_score)
 
-  cmake_parse_arguments(AVND "" "TARGET;MAIN_CLASS;NAMESPACE" "SOURCES" ${ARGN})
+  cmake_parse_arguments(AVND "DEVICE" "TARGET;MAIN_CLASS;NAMESPACE" "SOURCES" ${ARGN})
 
   if(AVND_NAMESPACE)
     set(AVND_QUALIFIED "${AVND_NAMESPACE}::${AVND_MAIN_CLASS}")
@@ -339,8 +341,13 @@ function(avnd_make_score)
     )
   endif()
 
+  if(AVND_DEVICE)
+    set(source_proto "${CMAKE_CURRENT_SOURCE_DIR}/device-prototype.cpp.in")
+  else()
+    set(source_proto "${CMAKE_CURRENT_SOURCE_DIR}/prototype.cpp.in")
+  endif()
   configure_file(
-    "${CMAKE_CURRENT_SOURCE_DIR}/prototype.cpp.in"
+    "${source_proto}"
     "${CMAKE_BINARY_DIR}/${AVND_TARGET}_avnd.cpp"
     @ONLY
     NEWLINE_STYLE LF
@@ -407,6 +414,12 @@ avnd_make_score(
   NAMESPACE ao
 )
 avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/Gain.hpp"
+  TARGET gain
+  MAIN_CLASS Gain
+  NAMESPACE ao
+)
+avnd_make_score(
   SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/StereoMixer.hpp"
   TARGET stereo_mixer
   MAIN_CLASS StereoMixer
@@ -443,6 +456,12 @@ avnd_make_score(
 )
 
 avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Midi/MidiGlide.hpp"
+  TARGET midi_glide
+  MAIN_CLASS MidiGlide
+  NAMESPACE mo
+)
+avnd_make_score(
   SOURCES "${AVND_FOLDER}/examples/Ports/Essentia/stats/Entropy.hpp"
   TARGET essentia_entropy
   MAIN_CLASS Entropy
@@ -478,6 +497,21 @@ avnd_make_score(
 )
 
 avnd_make_score(
+  SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/AvndProcesses/AudioRecorder.hpp"
+  TARGET audio_recorder
+  MAIN_CLASS AudioRecorder
+
+  NAMESPACE avnd_tools
+)
+
+avnd_make_score(
+  SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/AvndProcesses/DeviceRecorder.hpp"
+  TARGET device_recorder
+  MAIN_CLASS DeviceRecorder
+  NAMESPACE avnd_tools
+)
+
+avnd_make_score(
   SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/AvndProcesses/Sweeper.hpp"
   TARGET pattern_sweeper
   MAIN_CLASS PatternSweeper
@@ -498,6 +532,12 @@ avnd_make_score(
   NAMESPACE examples::helpers
 )
 
+avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/Trigger.hpp"
+  TARGET trigger
+  MAIN_CLASS Trigger
+  NAMESPACE examples
+)
 avnd_make_score(
   SOURCES "${AVND_FOLDER}/examples/Raw/Interpolator.hpp"
   TARGET exponential_smoothing
@@ -527,12 +567,46 @@ avnd_make_score(
 )
 
 avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/AudioSum.hpp"
+  TARGET audio_sum
+  MAIN_CLASS AudioSum
+  NAMESPACE ao
+)
+
+avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/MonoMix.hpp"
+  TARGET mono_mix_8
+  MAIN_CLASS MonoMix
+  NAMESPACE ao
+)
+
+avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/QuadPan.hpp"
+  TARGET quad_pan
+  MAIN_CLASS QuadPan
+  NAMESPACE ao
+)
+
+avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/Silence.hpp"
+  TARGET silence
+  MAIN_CLASS Silence
+  NAMESPACE ao
+)
+
+avnd_make_score(
   SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/LightnessSampler.hpp"
   TARGET lightness_sampler
   MAIN_CLASS LightnessSampler
   NAMESPACE vo
 )
 
+avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Advanced/Utilities/LightnessComputer.hpp"
+  TARGET lightness_computer
+  MAIN_CLASS LightnessComputer
+  NAMESPACE vo
+)
 
 avnd_make_score(
   SOURCES "${AVND_FOLDER}/examples/Gpu/SolidColor.hpp"
@@ -549,11 +623,57 @@ avnd_make_score(
 )
 
 avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Raw/ProcessLauncher.hpp"
+  TARGET avnd_process
+  MAIN_CLASS ProcessLauncher
+  NAMESPACE examples
+)
+
+avnd_make_score(
   SOURCES "${AVND_FOLDER}/examples/Raw/Shell.hpp"
   TARGET avnd_shell
   MAIN_CLASS Shell
   NAMESPACE examples
 )
+
+avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Helpers/ValueDelay.hpp"
+  TARGET avnd_value_delay
+  MAIN_CLASS ValueDelay
+  NAMESPACE examples::helpers
+)
+
+avnd_make_score(
+  SOURCES "${AVND_FOLDER}/examples/Helpers/Poles.hpp"
+  TARGET avnd_poles
+  MAIN_CLASS Poles
+  NAMESPACE examples::helpers
+)
+
+avnd_make_score(
+  SOURCES
+    "${AVND_FOLDER}/examples/Advanced/AudioParticles/AudioParticles.hpp"
+    "${AVND_FOLDER}/examples/Advanced/AudioParticles/AudioParticles.cpp"
+  TARGET avnd_audio_particles
+  MAIN_CLASS AudioParticles
+  NAMESPACE ao
+)
+avnd_make_score(
+  SOURCES
+    "${AVND_FOLDER}/examples/Advanced/GeoZones/GeoZones.hpp"
+    "${AVND_FOLDER}/examples/Advanced/GeoZones/GeoZones.cpp"
+  TARGET geozones
+  MAIN_CLASS GeoZones
+  NAMESPACE co
+)
+
+avnd_make_score(
+    SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/AvndProcesses/Teleplot.hpp"
+  TARGET teleplot
+  MAIN_CLASS Teleplot
+  NAMESPACE avnd_tools
+)
+
 
 # avnd_make_score(
 #   SOURCES

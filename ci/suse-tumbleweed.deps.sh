@@ -9,6 +9,7 @@ source ci/common.deps.sh
 
 $SUDO zypper -n remove busybox-which
 $SUDO zypper -n install \
+   git \
    cmake ninja gcc gcc-c++ \
    llvm-devel \
    libjack-devel alsa-devel \
@@ -17,6 +18,7 @@ $SUDO zypper -n install \
    libavahi-devel \
    fftw3-devel fftw3-threads-devel \
    bluez-devel \
+   dbus-1-devel \
    qt6-base-devel qt6-base-private-devel  \
    qt6-declarative-devel qt6-declarative-private-devel \
    qt6-tools \

@@ -15,6 +15,7 @@
 #include <QPixmap>
 #include <QPointer>
 #include <QSettings>
+#include <QTextLayout>
 
 #include <score_git_info.hpp>
 
@@ -22,6 +23,8 @@
 #include <verdigris>
 
 namespace score
+{
+namespace
 {
 template <typename OnSuccess, typename OnError>
 class HTTPGet final : public QNetworkAccessManager
@@ -64,6 +67,7 @@ private:
   OnError m_error;
 };
 
+}
 class InteractiveLabel : public QWidget
 {
   W_OBJECT(InteractiveLabel)
@@ -77,8 +81,12 @@ public:
 
   void disableInteractivity();
   void setActiveColor(const QColor& c);
+  void setInactiveColor(const QColor& c);
+  void setTextOption(QTextOption opt) { m_textOption = opt; }
 
   void labelPressed(const QString& file) W_SIGNAL(labelPressed, file)
+
+  QRectF textBoundingBox(double width) const noexcept;
 
 protected:
   void paintEvent(QPaintEvent* event) override;
@@ -91,16 +99,19 @@ private:
   QString m_title;
 
   QString m_url;
-  bool m_openExternalLink;
+  bool m_openExternalLink{};
 
-  bool m_drawPixmap;
+  bool m_drawPixmap{};
   QPixmap m_currentPixmap;
   QPixmap m_pixmap;
   QPixmap m_pixmapOn;
 
-  bool m_interactive;
+  bool m_interactive{};
   QColor m_currentColor;
   QColor m_activeColor;
+  QColor m_inactiveColor;
+
+  QTextOption m_textOption;
 };
 
 InteractiveLabel::InteractiveLabel(
@@ -114,8 +125,9 @@ InteractiveLabel::InteractiveLabel(
     , m_interactive(true)
 {
   auto& skin = score::Skin::instance();
-  m_currentColor = QColor{"#f0f0f0"};
+  m_inactiveColor = QColor{"#d3d3d3"}; //"#f0f0f0"};
   m_activeColor = QColor{"#03C3DD"};
+  m_currentColor = m_inactiveColor;
   setCursor(skin.CursorPointingHand);
   setFixedSize(200, 34);
 }
@@ -139,6 +151,36 @@ void InteractiveLabel::setActiveColor(const QColor& c)
   m_activeColor = c;
 }
 
+void InteractiveLabel::setInactiveColor(const QColor& c)
+{
+  m_inactiveColor = c;
+  m_currentColor = m_inactiveColor;
+}
+
+QRectF InteractiveLabel::textBoundingBox(double width) const noexcept
+{
+  int leading = QFontMetrics{m_font}.leading();
+  QTextLayout lay;
+  lay.setText(m_title);
+  lay.setFont(m_font);
+  lay.setTextOption(m_textOption);
+  lay.beginLayout();
+  double height{};
+  while(true)
+  {
+    QTextLine line = lay.createLine();
+    if(!line.isValid())
+      break;
+
+    line.setLineWidth(width);
+    height += leading;
+    line.setPosition(QPointF(0, height));
+    height += line.height();
+  }
+  lay.endLayout();
+  return lay.boundingRect();
+}
+
 void InteractiveLabel::paintEvent(QPaintEvent* event)
 {
   QPainter painter(this);
@@ -147,15 +189,32 @@ void InteractiveLabel::paintEvent(QPaintEvent* event)
   painter.setRenderHint(QPainter::TextAntialiasing, true);
   painter.setPen(QPen{m_currentColor});
 
+  painter.save();
   QRectF textRect = rect();
   if(m_drawPixmap)
   {
-    int size = m_currentPixmap.width();
-    painter.drawPixmap(0, 0, m_currentPixmap);
-    textRect.setX(textRect.x() + size / qApp->devicePixelRatio() + 6);
+    int size = m_currentPixmap.width() / qApp->devicePixelRatio();
+    int pixmapX = 0;
+
+    if(m_textOption.alignment() == Qt::AlignRight)
+    {
+      QTextLayout lay;
+      lay.setText(m_title);
+      lay.setFont(m_font);
+      lay.setTextOption(m_textOption);
+      lay.beginLayout();
+      lay.createLine();
+      lay.endLayout();
+      pixmapX = lay.boundingRect().width();
+    }
+    painter.drawPixmap(
+        width() - pixmapX - m_currentPixmap.width() - 6,
+        (textRect.height() - size - 10) / 2, m_currentPixmap);
+    textRect.setX(textRect.x() + size + 6);
   }
   painter.setFont(m_font);
-  painter.drawText(textRect, m_title);
+  painter.drawText(textRect, m_title, m_textOption);
+  painter.restore();
 }
 
 void InteractiveLabel::enterEvent(QEnterEvent* event)
@@ -175,7 +234,7 @@ void InteractiveLabel::leaveEvent(QEvent* event)
   if(!m_interactive)
     return;
 
-  m_currentColor = QColor{"#f0f0f0"};
+  m_currentColor = m_inactiveColor;
   m_font.setUnderline(false);
   m_currentPixmap = m_pixmap;
 
@@ -193,7 +252,6 @@ void InteractiveLabel::mousePressEvent(QMouseEvent* event)
     labelPressed(m_url);
   }
 }
-
 class StartScreen : public QWidget
 {
   W_OBJECT(StartScreen)
@@ -263,14 +321,91 @@ StartScreen::StartScreen(const QPointer<QRecentFilesMenu>& recentFiles, QWidget*
 
     painter.setFont(f);
     //painter.drawText(QPointF(250, 170), QCoreApplication::applicationVersion());
-    painter.drawText(QPointF(381, 195), QCoreApplication::applicationVersion());
+    painter.drawText(QPointF(217, 188), QCoreApplication::applicationVersion());
     painter.end();
   }
 
   // Weird code here is because the window size seems to scale only to integer ratios.
   setFixedSize(m_background.size() / std::floor(qApp->devicePixelRatio()));
 
-  float label_y = 285;
+  {
+    // new version
+    auto m_getLastVersion = new HTTPGet{
+        QUrl("https://ossia.io/score-last-version.txt"),
+        [this, titleFont](const QByteArray& data) {
+      auto version = QString::fromUtf8(data.simplified());
+      if(SCORE_TAG_NO_V < version)
+      {
+        QString text
+            = qApp->tr("New version %1 is available, click to update !").arg(version);
+        QString url = "https://github.com/ossia/score/releases/latest/";
+        InteractiveLabel* label = new InteractiveLabel{titleFont, text, url, this};
+        label->setPixmaps(
+            score::get_pixmap(":/icons/version_on.png"),
+            score::get_pixmap(":/icons/version_off.png"));
+        label->setOpenExternalLink(true);
+        label->setInactiveColor(QColor{"#f6a019"});
+        label->setActiveColor(QColor{"#f0f0f0"});
+        label->setFixedWidth(600);
+        label->move(280, 170);
+        label->show();
+      }
+    }, [] {}};
+  }
+
+  float label_x = 300;
+  float label_y = 215;
+
+  { // recent files
+    auto label = new InteractiveLabel{titleFont, qApp->tr("Recent files"), "", this};
+    label->setTextOption(QTextOption(Qt::AlignRight));
+    label->setPixmaps(
+        score::get_pixmap(":/icons/recent_files.png"),
+        score::get_pixmap(":/icons/recent_files.png"));
+    label->setInactiveColor(QColor{"#f0f0f0"});
+    label->setActiveColor(QColor{"#03C3DD"});
+    label->disableInteractivity();
+    label->move(label_x, label_y);
+    label_y += 35;
+  }
+  f.setPointSize(12);
+
+  // label_x += 40;
+  for(const auto& action : recentFiles->actions())
+  {
+    auto fileLabel
+        = new InteractiveLabel{f, action->text(), action->data().toString(), this};
+    fileLabel->setTextOption(QTextOption(Qt::AlignRight));
+    connect(
+        fileLabel, &score::InteractiveLabel::labelPressed, this,
+        &score::StartScreen::openFile);
+
+    auto textHeight = std::max(25, (int)fileLabel->textBoundingBox(200).height() + 7);
+    fileLabel->setFixedSize(200, textHeight);
+    fileLabel->move(label_x, label_y);
+    label_y += textHeight + 1;
+  }
+  // label_x = 160;
+  label_y += 10;
+
+  m_crashLabel
+      = new InteractiveLabel{titleFont, qApp->tr("Restore last session"), "", this};
+  m_crashLabel->setTextOption(QTextOption(Qt::AlignRight));
+  m_crashLabel->setPixmaps(
+      score::get_pixmap(":/icons/reload_crash_off.png"),
+      score::get_pixmap(":/icons/reload_crash_on.png"));
+  m_crashLabel->move(label_x - 100, label_y);
+  m_crashLabel->setFixedWidth(300);
+  m_crashLabel->setInactiveColor(QColor{"#f0f0f0"});
+  m_crashLabel->setActiveColor(QColor{"#f6a019"});
+  m_crashLabel->setDisabled(true);
+  m_crashLabel->hide();
+  connect(
+      m_crashLabel, &score::InteractiveLabel::labelPressed, this,
+      &score::StartScreen::loadCrashedSession);
+
+  label_x = 510;
+  label_y = 215;
   { // Create new
     InteractiveLabel* label = new InteractiveLabel{titleFont, qApp->tr("New"), "", this};
     label->setPixmaps(
@@ -279,7 +414,7 @@ StartScreen::StartScreen(const QPointer<QRecentFilesMenu>& recentFiles, QWidget*
     connect(
         label, &score::InteractiveLabel::labelPressed, this,
         &score::StartScreen::openNewDocument);
-    label->move(100, label_y);
+    label->move(label_x, label_y);
     label_y += 35;
   }
   { // Load file
@@ -291,7 +426,7 @@ StartScreen::StartScreen(const QPointer<QRecentFilesMenu>& recentFiles, QWidget*
     connect(
         label, &score::InteractiveLabel::labelPressed, this,
         &score::StartScreen::openFileDialog);
-    label->move(100, label_y);
+    label->move(label_x, label_y);
     label_y += 35;
   }
   { // Load Examples
@@ -303,68 +438,11 @@ StartScreen::StartScreen(const QPointer<QRecentFilesMenu>& recentFiles, QWidget*
         score::get_pixmap(":/icons/load_examples_off.png"),
         score::get_pixmap(":/icons/load_examples_on.png"));
     label->setOpenExternalLink(true);
-    label->move(100, label_y);
+    label->move(label_x, label_y);
     label_y += 35;
   }
-  { // Exit App
-    InteractiveLabel* label
-        = new InteractiveLabel{titleFont, qApp->tr("Exit"), "", this};
-    label->setPixmaps(
-        score::get_pixmap(":/icons/exit_off.png"),
-        score::get_pixmap(":/icons/exit_on.png"));
-    connect(
-        label, &score::InteractiveLabel::labelPressed, this,
-        &score::StartScreen::exitApp);
-    label->move(100, label_y);
-    label_y += 50;
-  }
-  label_y = 285;
-  { // recent files
-    InteractiveLabel* label
-        = new InteractiveLabel{titleFont, qApp->tr("Recent files"), "", this};
-    label->setPixmaps(
-        score::get_pixmap(":/icons/recent_files.png"),
-        score::get_pixmap(":/icons/recent_files.png"));
-    label->disableInteractivity();
-    label->move(280, label_y);
-    label_y += 30;
-  }
-  {
-    // new version
-    auto m_getLastVersion = new HTTPGet{
-        QUrl("https://ossia.io/score-last-version.txt"),
-        [=](const QByteArray& data) {
-      auto version = QString::fromUtf8(data.simplified());
-      if(SCORE_TAG_NO_V < version)
-      {
-        QString text
-            = qApp->tr("New version %1 is available, click to update !").arg(version);
-        QString url = "https://github.com/ossia/score/releases/latest/";
-        InteractiveLabel* label = new InteractiveLabel{titleFont, text, url, this};
-        label->setPixmaps(
-            score::get_pixmap(":/icons/version_off.png"),
-            score::get_pixmap(":/icons/version_on.png"));
-        label->setOpenExternalLink(true);
-        label->setFixedWidth(600);
-        label->move(140, 245);
-        label->show();
-      }
-        },
-        [] {}};
-  }
-  f.setPointSize(12);
-  for(const auto& action : recentFiles->actions())
-  {
-    InteractiveLabel* fileLabel
-        = new InteractiveLabel{f, action->text(), action->data().toString(), this};
-    connect(
-        fileLabel, &score::InteractiveLabel::labelPressed, this,
-        &score::StartScreen::openFile);
 
-    fileLabel->move(310, label_y);
-
-    label_y += 25;
-  }
+  label_y += 20;
 
   std::array<score::StartScreenLink, 4> menus
       = {{{qApp->tr("Tutorials"),
@@ -377,29 +455,28 @@ StartScreen::StartScreen(const QPointer<QRecentFilesMenu>& recentFiles, QWidget*
            ":/icons/forum_on.png"},
           {qApp->tr("Chat"), "https://gitter.im/ossia/score", ":/icons/chat_off.png",
            ":/icons/chat_on.png"}}};
-  label_y = 285;
   for(const auto& m : menus)
   {
     InteractiveLabel* menu_url = new InteractiveLabel{titleFont, m.name, m.url, this};
     menu_url->setOpenExternalLink(true);
     menu_url->setPixmaps(score::get_pixmap(m.pixmap), score::get_pixmap(m.pixmapOn));
-    menu_url->move(530, label_y);
-    label_y += 40;
+    menu_url->move(label_x, label_y);
+    label_y += 35;
   }
 
-  m_crashLabel = new InteractiveLabel{
-      titleFont, qApp->tr("Reload your previously crashed work ?"), "", this};
-  m_crashLabel->setPixmaps(
-      score::get_pixmap(":/icons/reload_crash_off.png"),
-      score::get_pixmap(":/icons/reload_crash_on.png"));
-  m_crashLabel->move(150, 460);
-  m_crashLabel->setFixedWidth(600);
-  m_crashLabel->setActiveColor(QColor{"#f6a019"});
-  m_crashLabel->setDisabled(true);
-  m_crashLabel->hide();
-  connect(
-      m_crashLabel, &score::InteractiveLabel::labelPressed, this,
-      &score::StartScreen::loadCrashedSession);
+  label_y += 10;
+
+  { // Exit App
+    InteractiveLabel* label
+        = new InteractiveLabel{titleFont, qApp->tr("Exit"), "", this};
+    label->setPixmaps(
+        score::get_pixmap(":/icons/exit_off.png"),
+        score::get_pixmap(":/icons/exit_on.png"));
+    connect(
+        label, &score::InteractiveLabel::labelPressed, this,
+        &score::StartScreen::exitApp);
+    label->move(label_x, label_y);
+  }
 }
 
 void StartScreen::addLoadCrashedSession()

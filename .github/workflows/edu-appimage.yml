@@ -1,24 +1,36 @@
 name: edu AppImage
 
 # Personal "Franken-build" of ossia/score.
-# Integrates the latest upstream/master with all origin/edu/* feature branches
-# and produces a single Linux x86_64 AppImage, published to the `edu-build`
-# release on this fork. Lives ONLY on the orphan `edu-build` branch so that
+#
+# Default mode tracks the OPEN PULL REQUESTS I have on upstream (ossia/score):
+# it merges each PR's head branch onto the latest upstream/master and builds a
+# single Linux x86_64 AppImage, published to the `edu-build` release on this
+# fork. Runs on a schedule so contributing a PR upstream is enough — no need to
+# touch the fork to trigger a build.
+#
+# Lives ONLY on the orphan `edu-build` branch (the fork's default branch) so
 # syncing `master` to upstream can never delete or conflict with it.
 #
-# Trigger: manual (workflow_dispatch) or via the local pre-push hook on edu/*.
-# Merge policy: alphabetical branch order, FAIL-FAST on conflict.
+# Modes (branch_filter):
+#   open-prs (default) -> branches that are head of an open PR I opened to ossia/score
+#   all                -> every origin/edu/* branch on this fork (local WIP testing)
 
 on:
   workflow_dispatch:
     inputs:
       branch_filter:
-        description: "Which edu/* branches to include"
+        description: "Which branches to include"
         type: choice
-        default: all
+        default: open-prs
         options:
-          - all          # every origin/edu/* branch
-          - open-prs     # only edu/* branches with an OPEN PR on upstream
+          - open-prs   # head branches of my open PRs to ossia/score
+          - all        # every origin/edu/* branch on the fork
+      force:
+        description: "Rebuild even if nothing changed"
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 */3 * * *'   # every 3h; skips quickly when nothing changed
 
 permissions:
   contents: write
@@ -27,119 +39,149 @@ concurrency:
   group: edu-appimage
   cancel-in-progress: true
 
+env:
+  UPSTREAM: ossia/score
+  FORK: edumeneses/score
+  CPU_ARCH: x86_64
+  OUT_NAME: ossia.score-master-linux-x86_64-edu.AppImage
+  STATE_NAME: edu-build-state.txt
+
 jobs:
   edu-appimage:
     name: edu AppImage (x86_64)
     runs-on: ubuntu-24.04
-    env:
-      CPU_ARCH: x86_64
-      UPSTREAM_URL: https://github.com/ossia/score.git
-      OUT_NAME: ossia.score-master-linux-x86_64-edu.AppImage
-
     steps:
-      - name: Checkout edu-build (for ci/ scripts come later via reset)
+      - name: Checkout edu-build
         uses: actions/checkout@v6
         with:
           ref: edu-build
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Integrate upstream/master + all edu/* branches
+      - name: Resolve sources, detect change, integrate
+        id: integrate
         env:
           GH_TOKEN: ${{ github.token }}
-          BRANCH_FILTER: ${{ inputs.branch_filter || 'all' }}
+          BRANCH_FILTER: ${{ inputs.branch_filter || 'open-prs' }}
+          FORCE: ${{ inputs.force || 'false' }}
         run: |
           set -euo pipefail
           git config user.name  "edu-build-ci"
           git config user.email "edu-build-ci@users.noreply.github.com"
 
-          echo "::group::Fetch upstream + edu/* branches"
-          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          echo "::group::Fetch upstream/master"
+          git remote add upstream "https://github.com/${UPSTREAM}.git" 2>/dev/null \
+            || git remote set-url upstream "https://github.com/${UPSTREAM}.git"
           git fetch --no-tags upstream master
-          # origin is this fork; grab every edu/* head
-          git fetch --no-tags origin "+refs/heads/edu/*:refs/remotes/origin/edu/*" || true
           echo "::endgroup::"
 
-          echo "::group::Reset working tree to upstream/master"
+          # --- Resolve the branch list -----------------------------------------
+          echo "::group::Resolve branches (filter=$BRANCH_FILTER)"
+          declare -a BRANCHES=()
+          if [ "$BRANCH_FILTER" = "all" ]; then
+            git fetch --no-tags origin "+refs/heads/edu/*:refs/remotes/origin/edu/*" || true
+            mapfile -t BRANCHES < <(git for-each-ref \
+                --format='%(refname:lstrip=3)' refs/remotes/origin/edu/ | sort)
+          else
+            # Head branches of MY open PRs to upstream (head repo == this fork).
+            mapfile -t BRANCHES < <(gh pr list --repo "$UPSTREAM" --state open --limit 300 \
+                --json headRefName,headRepositoryOwner \
+                -q '.[] | select(.headRepositoryOwner.login=="edumeneses") | .headRefName' \
+                | sort -u)
+            # Fetch each PR head branch from the fork (origin).
+            for B in "${BRANCHES[@]:-}"; do
+              [ -n "$B" ] || continue
+              git fetch --no-tags origin "+refs/heads/${B}:refs/remotes/origin/${B}"
+            done
+          fi
+          echo "branches (${#BRANCHES[@]}): ${BRANCHES[*]:-(none)}"
+          echo "::endgroup::"
+
+          # --- Change detection -------------------------------------------------
+          echo "::group::Compute build state"
+          {
+            echo "filter=$BRANCH_FILTER"
+            echo "upstream/master=$(git rev-parse upstream/master)"
+            for B in "${BRANCHES[@]:-}"; do
+              [ -n "$B" ] || continue
+              echo "${B}=$(git rev-parse "origin/${B}")"
+            done
+          } | sort > "$RUNNER_TEMP/new-state.txt"
+          NEW_HASH=$(sha256sum "$RUNNER_TEMP/new-state.txt" | cut -d' ' -f1)
+          echo "new state hash: $NEW_HASH"
+
+          PREV_HASH=""
+          if gh release download edu-build --repo "$FORK" \
+               --pattern "$STATE_NAME" --dir "$RUNNER_TEMP" --clobber 2>/dev/null; then
+            PREV_HASH=$(sha256sum "$RUNNER_TEMP/$STATE_NAME" | cut -d' ' -f1) || PREV_HASH=""
+          fi
+          echo "prev state hash: ${PREV_HASH:-(none)}"
+          echo "::endgroup::"
+
+          if [ "$NEW_HASH" = "$PREV_HASH" ] && [ "$FORCE" != "true" ]; then
+            echo "No change since last build (and force=false). Skipping build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+          # Persist the state file so the stage step can publish it.
+          cp "$RUNNER_TEMP/new-state.txt" "$RUNNER_TEMP/$STATE_NAME"
+
+          # --- Integrate: reset to upstream/master, merge branches (fail-fast) --
+          echo "::group::Reset to upstream/master"
           git checkout -B edu-integration upstream/master
           git submodule update --init --recursive
           echo "::endgroup::"
 
-          # Candidate set: every origin/edu/* head (short name, e.g. "edu/foo"),
-          # alphabetical -> deterministic merge order.
-          mapfile -t CANDIDATES < <(git for-each-ref \
-              --format='%(refname:lstrip=3)' refs/remotes/origin/edu/ | sort)
-
-          if [ "$BRANCH_FILTER" = "open-prs" ]; then
-            echo "::group::Filter to edu/* branches with an open upstream PR"
-            # Head branches of open PRs to upstream whose head repo is this fork.
-            mapfile -t PR_HEADS < <(gh pr list --repo ossia/score --state open --limit 300 \
-                --json headRefName,headRepositoryOwner \
-                -q '.[] | select(.headRepositoryOwner.login=="edumeneses") | .headRefName' \
-                | sort -u)
-            echo "open-PR head branches: ${PR_HEADS[*]:-(none)}"
-            BRANCHES=()
-            for C in "${CANDIDATES[@]}"; do
-              for H in "${PR_HEADS[@]:-}"; do
-                if [ "$C" = "$H" ]; then BRANCHES+=("$C"); break; fi
-              done
-            done
-            echo "::endgroup::"
-          else
-            BRANCHES=("${CANDIDATES[@]}")
-          fi
-
-          echo "Filter=$BRANCH_FILTER -> ${#BRANCHES[@]} branch(es): ${BRANCHES[*]:-(none)}"
-          if [ "${#BRANCHES[@]}" -eq 0 ]; then
-            echo "::warning::No matching edu/* branches — building plain upstream/master."
-          fi
-          # merge refs are origin/<name>; prefix them.
-          BRANCHES=("${BRANCHES[@]/#/origin/}")
-          for B in "${BRANCHES[@]}"; do
+          for B in "${BRANCHES[@]:-}"; do
+            [ -n "$B" ] || continue
             echo "::group::Merge $B"
-            if git merge --no-edit "$B"; then
+            if git merge --no-edit "origin/${B}"; then
               echo "merged $B"
             else
-              echo "::error::Merge conflict while merging '$B' onto the integration branch. Aborting (fail-fast)."
+              echo "::error::Merge conflict on '$B'. Aborting (fail-fast). Rebase it on upstream/master and retry."
               git merge --abort || true
               exit 1
             fi
             echo "::endgroup::"
           done
-
-          # edu/* branches may bump submodules; refresh.
           git submodule update --init --recursive
 
       - name: Dependencies
-        run: |
-          export CPU_ARCH="$CPU_ARCH"
-          ./ci/appimage.deps.sh
+        if: steps.integrate.outputs.skip != 'true'
+        run: ./ci/appimage.deps.sh
 
       - name: Build
+        if: steps.integrate.outputs.skip != 'true'
         run: |
-          export CPU_ARCH="$CPU_ARCH"
           export GITTAGNOV=master
           ./ci/appimage.build.sh
 
-      - name: Stage AppImage
+      - name: Stage artifacts
+        if: steps.integrate.outputs.skip != 'true'
         run: |
           set -eux
           mkdir -p staging
           mv "Score.AppImage" "staging/${OUT_NAME}"
+          cp "$RUNNER_TEMP/${STATE_NAME}" "staging/${STATE_NAME}"
 
       - name: Upload artifact
+        if: steps.integrate.outputs.skip != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: edu-appimage-x86_64
           path: staging/${{ env.OUT_NAME }}
 
       - name: Publish to edu-build release
+        if: steps.integrate.outputs.skip != 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: edu-build
           name: "edu custom build"
-          body: "Personal integration build of ossia score: latest upstream/master + all edu/* feature branches. Linux x86_64 only. Auto-overwritten on every run."
+          body: "Personal integration build of ossia score: latest upstream/master + my open-PR branches. Linux x86_64 only. Auto-rebuilt on change."
           append_body: false
           generate_release_notes: false
           files: |
             staging/${{ env.OUT_NAME }}
+            staging/${{ env.STATE_NAME }}

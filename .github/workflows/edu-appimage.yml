@@ -11,6 +11,14 @@ name: edu AppImage
 
 on:
   workflow_dispatch:
+    inputs:
+      branch_filter:
+        description: "Which edu/* branches to include"
+        type: choice
+        default: all
+        options:
+          - all          # every origin/edu/* branch
+          - open-prs     # only edu/* branches with an OPEN PR on upstream
 
 permissions:
   contents: write
@@ -37,6 +45,9 @@ jobs:
           persist-credentials: true
 
       - name: Integrate upstream/master + all edu/* branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_FILTER: ${{ inputs.branch_filter || 'all' }}
         run: |
           set -euo pipefail
           git config user.name  "edu-build-ci"
@@ -54,11 +65,36 @@ jobs:
           git submodule update --init --recursive
           echo "::endgroup::"
 
-          # Alphabetical, deterministic order. Fail-fast on first conflict.
-          mapfile -t BRANCHES < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin/edu/ | sort)
-          if [ "${#BRANCHES[@]}" -eq 0 ]; then
-            echo "::warning::No origin/edu/* branches found — building plain upstream/master."
+          # Candidate set: every origin/edu/* head (short name, e.g. "edu/foo"),
+          # alphabetical -> deterministic merge order.
+          mapfile -t CANDIDATES < <(git for-each-ref \
+              --format='%(refname:lstrip=3)' refs/remotes/origin/edu/ | sort)
+
+          if [ "$BRANCH_FILTER" = "open-prs" ]; then
+            echo "::group::Filter to edu/* branches with an open upstream PR"
+            # Head branches of open PRs to upstream whose head repo is this fork.
+            mapfile -t PR_HEADS < <(gh pr list --repo ossia/score --state open --limit 300 \
+                --json headRefName,headRepositoryOwner \
+                -q '.[] | select(.headRepositoryOwner.login=="edumeneses") | .headRefName' \
+                | sort -u)
+            echo "open-PR head branches: ${PR_HEADS[*]:-(none)}"
+            BRANCHES=()
+            for C in "${CANDIDATES[@]}"; do
+              for H in "${PR_HEADS[@]:-}"; do
+                if [ "$C" = "$H" ]; then BRANCHES+=("$C"); break; fi
+              done
+            done
+            echo "::endgroup::"
+          else
+            BRANCHES=("${CANDIDATES[@]}")
           fi
+
+          echo "Filter=$BRANCH_FILTER -> ${#BRANCHES[@]} branch(es): ${BRANCHES[*]:-(none)}"
+          if [ "${#BRANCHES[@]}" -eq 0 ]; then
+            echo "::warning::No matching edu/* branches — building plain upstream/master."
+          fi
+          # merge refs are origin/<name>; prefix them.
+          BRANCHES=("${BRANCHES[@]/#/origin/}")
           for B in "${BRANCHES[@]}"; do
             echo "::group::Merge $B"
             if git merge --no-edit "$B"; then

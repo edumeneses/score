@@ -1,0 +1,109 @@
+name: edu AppImage
+
+# Personal "Franken-build" of ossia/score.
+# Integrates the latest upstream/master with all origin/edu/* feature branches
+# and produces a single Linux x86_64 AppImage, published to the `edu-build`
+# release on this fork. Lives ONLY on the orphan `edu-build` branch so that
+# syncing `master` to upstream can never delete or conflict with it.
+#
+# Trigger: manual (workflow_dispatch) or via the local pre-push hook on edu/*.
+# Merge policy: alphabetical branch order, FAIL-FAST on conflict.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: edu-appimage
+  cancel-in-progress: true
+
+jobs:
+  edu-appimage:
+    name: edu AppImage (x86_64)
+    runs-on: ubuntu-24.04
+    env:
+      CPU_ARCH: x86_64
+      UPSTREAM_URL: https://github.com/ossia/score.git
+      OUT_NAME: ossia.score-master-linux-x86_64-edu.AppImage
+
+    steps:
+      - name: Checkout edu-build (for ci/ scripts come later via reset)
+        uses: actions/checkout@v6
+        with:
+          ref: edu-build
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Integrate upstream/master + all edu/* branches
+        run: |
+          set -euo pipefail
+          git config user.name  "edu-build-ci"
+          git config user.email "edu-build-ci@users.noreply.github.com"
+
+          echo "::group::Fetch upstream + edu/* branches"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream master
+          # origin is this fork; grab every edu/* head
+          git fetch --no-tags origin "+refs/heads/edu/*:refs/remotes/origin/edu/*" || true
+          echo "::endgroup::"
+
+          echo "::group::Reset working tree to upstream/master"
+          git checkout -B edu-integration upstream/master
+          git submodule update --init --recursive
+          echo "::endgroup::"
+
+          # Alphabetical, deterministic order. Fail-fast on first conflict.
+          mapfile -t BRANCHES < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin/edu/ | sort)
+          if [ "${#BRANCHES[@]}" -eq 0 ]; then
+            echo "::warning::No origin/edu/* branches found — building plain upstream/master."
+          fi
+          for B in "${BRANCHES[@]}"; do
+            echo "::group::Merge $B"
+            if git merge --no-edit "$B"; then
+              echo "merged $B"
+            else
+              echo "::error::Merge conflict while merging '$B' onto the integration branch. Aborting (fail-fast)."
+              git merge --abort || true
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+          # edu/* branches may bump submodules; refresh.
+          git submodule update --init --recursive
+
+      - name: Dependencies
+        run: |
+          export CPU_ARCH="$CPU_ARCH"
+          ./ci/appimage.deps.sh
+
+      - name: Build
+        run: |
+          export CPU_ARCH="$CPU_ARCH"
+          export GITTAGNOV=master
+          ./ci/appimage.build.sh
+
+      - name: Stage AppImage
+        run: |
+          set -eux
+          mkdir -p staging
+          mv "Score.AppImage" "staging/${OUT_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: edu-appimage-x86_64
+          path: staging/${{ env.OUT_NAME }}
+
+      - name: Publish to edu-build release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: edu-build
+          name: "edu custom build"
+          body: "Personal integration build of ossia score: latest upstream/master + all edu/* feature branches. Linux x86_64 only. Auto-overwritten on every run."
+          append_body: false
+          generate_release_notes: false
+          files: |
+            staging/${{ env.OUT_NAME }}

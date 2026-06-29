@@ -75,26 +75,33 @@ jobs:
           git fetch --no-tags upstream master
           echo "::endgroup::"
 
-          # --- Resolve the branch list -----------------------------------------
-          echo "::group::Resolve branches (filter=$BRANCH_FILTER)"
-          declare -a BRANCHES=()
+          # --- Resolve the merge refs ------------------------------------------
+          # MERGE_REFS = local refs to merge onto upstream/master, in order.
+          echo "::group::Resolve refs (filter=$BRANCH_FILTER)"
+          declare -a MERGE_REFS=()
           if [ "$BRANCH_FILTER" = "all" ]; then
+            # Every edu/* branch on the fork (origin). Local WIP testing.
             git fetch --no-tags origin "+refs/heads/edu/*:refs/remotes/origin/edu/*" || true
-            mapfile -t BRANCHES < <(git for-each-ref \
+            mapfile -t NAMES < <(git for-each-ref \
                 --format='%(refname:lstrip=3)' refs/remotes/origin/edu/ | sort)
+            for N in "${NAMES[@]:-}"; do
+              [ -n "$N" ] && MERGE_REFS+=("origin/${N}")
+            done
           else
-            # Head branches of MY open PRs to upstream (head repo == this fork).
-            mapfile -t BRANCHES < <(gh pr list --repo "$UPSTREAM" --state open --limit 300 \
-                --json headRefName,headRepositoryOwner \
-                -q '.[] | select(.headRepositoryOwner.login=="edumeneses") | .headRefName' \
-                | sort -u)
-            # Fetch each PR head branch from the fork (origin).
-            for B in "${BRANCHES[@]:-}"; do
-              [ -n "$B" ] || continue
-              git fetch --no-tags origin "+refs/heads/${B}:refs/remotes/origin/${B}"
+            # All open PRs on upstream authored by edumeneses. The base repo
+            # exposes every PR at refs/pull/<N>/head regardless of where the head
+            # branch lives (an upstream branch or a fork), so a number-based
+            # fetch is robust. Merge in ascending PR-number order.
+            mapfile -t PRS < <(gh pr list --repo "$UPSTREAM" --state open \
+                --author edumeneses --limit 300 --json number -q '.[].number' \
+                | sort -n)
+            for P in "${PRS[@]:-}"; do
+              [ -n "$P" ] || continue
+              git fetch --no-tags upstream "refs/pull/${P}/head:refs/remotes/pr/${P}"
+              MERGE_REFS+=("pr/${P}")
             done
           fi
-          echo "branches (${#BRANCHES[@]}): ${BRANCHES[*]:-(none)}"
+          echo "merge refs (${#MERGE_REFS[@]}): ${MERGE_REFS[*]:-(none)}"
           echo "::endgroup::"
 
           # --- Change detection -------------------------------------------------
@@ -102,9 +109,9 @@ jobs:
           {
             echo "filter=$BRANCH_FILTER"
             echo "upstream/master=$(git rev-parse upstream/master)"
-            for B in "${BRANCHES[@]:-}"; do
-              [ -n "$B" ] || continue
-              echo "${B}=$(git rev-parse "origin/${B}")"
+            for R in "${MERGE_REFS[@]:-}"; do
+              [ -n "$R" ] || continue
+              echo "${R}=$(git rev-parse "$R")"
             done
           } | sort > "$RUNNER_TEMP/new-state.txt"
           NEW_HASH=$(sha256sum "$RUNNER_TEMP/new-state.txt" | cut -d' ' -f1)
@@ -134,13 +141,13 @@ jobs:
           git submodule update --init --recursive
           echo "::endgroup::"
 
-          for B in "${BRANCHES[@]:-}"; do
-            [ -n "$B" ] || continue
-            echo "::group::Merge $B"
-            if git merge --no-edit "origin/${B}"; then
-              echo "merged $B"
+          for R in "${MERGE_REFS[@]:-}"; do
+            [ -n "$R" ] || continue
+            echo "::group::Merge $R"
+            if git merge --no-edit "$R"; then
+              echo "merged $R"
             else
-              echo "::error::Merge conflict on '$B'. Aborting (fail-fast). Rebase it on upstream/master and retry."
+              echo "::error::Merge conflict on '$R'. Aborting (fail-fast). Rebase that PR on upstream/master and retry."
               git merge --abort || true
               exit 1
             fi

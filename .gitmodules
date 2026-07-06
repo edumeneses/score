@@ -1,0 +1,117 @@
+[submodule "3rdparty/QProgressIndicator"]
+	path = 3rdparty/QProgressIndicator
+	url = https://github.com/jcelerier/QProgressIndicator
+[submodule "3rdparty/Qt-Color-Widgets"]
+	path = 3rdparty/Qt-Color-Widgets
+	url = https://github.com/jcelerier/Qt-Color-Widgets.git
+[submodule "Documentation/Doxygen/doxygen-bootstrapped"]
+	path = docs/Doxygen/doxygen-bootstrapped
+	url = https://github.com/Velron/doxygen-bootstrapped
+[submodule "3rdparty/phantomstyle"]
+	path = 3rdparty/phantomstyle
+	url = https://github.com/jcelerier/phantomstyle
+[submodule "3rdparty/zipdownloader"]
+	path = 3rdparty/zipdownloader
+	url = https://github.com/jcelerier/zipdownloader
+[submodule "3rdparty/magicitems"]
+	path = 3rdparty/magicitems
+	url = https://github.com/jcelerier/magicitems
+[submodule "3rdparty/QCodeEditor"]
+	path = 3rdparty/QCodeEditor
+	url = https://github.com/jcelerier/QCodeEditor
+[submodule "3rdparty/vst3/public.sdk"]
+	path = 3rdparty/vst3/public.sdk
+	url = https://github.com/jcelerier/vst3_public_sdk
+[submodule "3rdparty/vst3/pluginterfaces"]
+	path = 3rdparty/vst3/pluginterfaces
+	url = https://github.com/jcelerier/vst3_pluginterfaces
+[submodule "3rdparty/vst3/base"]
+	path = 3rdparty/vst3/base
+	url = https://github.com/steinbergmedia/vst3_base
+[submodule "3rdparty/vst3/cmake"]
+	path = 3rdparty/vst3/cmake
+	url = https://github.com/jcelerier/vst3_cmake
+[submodule "3rdparty/libossia"]
+        path = 3rdparty/libossia
+        url = https://github.com/ossia/libossia
+[submodule "3rdparty/libpd"]
+	path = 3rdparty/libpd
+	url = https://github.com/jcelerier/libpd
+[submodule "3rdparty/snappy"]
+	path = 3rdparty/snappy
+	url = https://github.com/jcelerier/snappy
+[submodule "3rdparty/hap"]
+	path = 3rdparty/hap
+	url = https://github.com/Vidvox/hap
+[submodule "3rdparty/libsndfile"]
+	path = 3rdparty/libsndfile
+	url = https://github.com/jcelerier/libsndfile
+[submodule "3rdparty/shmdata"]
+	path = 3rdparty/shmdata
+	url = https://gitlab.com/sat-metalab/shmdata
+[submodule "3rdparty/Gist"]
+	path = 3rdparty/Gist
+	url = https://github.com/jcelerier/Gist
+[submodule "3rdparty/Syphon-Framework"]
+	path = 3rdparty/Syphon-Framework
+	url = https://github.com/jcelerier/Syphon-Framework
+[submodule "3rdparty/avendish"]
+	path = 3rdparty/avendish
+	url = https://github.com/celtera/avendish
+[submodule "3rdparty/llfio"]
+	path = 3rdparty/llfio
+	url = https://github.com/jcelerier/llfio
+[submodule "3rdparty/quickcpplib"]
+	path = 3rdparty/quickcpplib
+	url = https://github.com/ned14/quickcpplib
+[submodule "3rdparty/outcome"]
+	path = 3rdparty/outcome
+	url = https://github.com/ned14/outcome
+[submodule "3rdparty/DSPFilters"]
+	path = 3rdparty/DSPFilters
+	url = https://github.com/jcelerier/DSPFilters
+[submodule "3rdparty/Gamma"]
+	path = 3rdparty/Gamma
+	url = https://github.com/LancePutnam/Gamma
+[submodule "3rdparty/Aether"]
+	path = 3rdparty/Aether
+	url = https://github.com/jcelerier/Aether.git
+[submodule "cmake/Deployment/Linux/Flatpak/shared-modules"]
+	path = cmake/Deployment/Linux/Flatpak/shared-modules
+	url = https://github.com/flathub/shared-modules
+[submodule "3rdparty/sh4lt"]
+	path = 3rdparty/sh4lt
+	url = https://gitlab.com/sh4lt/sh4lt
+[submodule "3rdparty/snmalloc"]
+	path = 3rdparty/snmalloc
+	url = https://github.com/microsoft/snmalloc/
+[submodule "3rdparty/libssynth"]
+	path = 3rdparty/libssynth
+	url = https://github.com/jcelerier/libssynth
+[submodule "3rdparty/vcglib"]
+	path = 3rdparty/vcglib
+	url = https://github.com/cnr-isti-vclab/vcglib
+[submodule "3rdparty/eigen"]
+	path = 3rdparty/eigen
+	url = https://gitlab.com/libeigen/eigen
+[submodule "3rdparty/miniply"]
+	path = 3rdparty/miniply
+	url = https://github.com/vilya/miniply
+[submodule "3rdparty/suil"]
+	path = 3rdparty/suil
+	url = https://github.com/lv2/suil
+[submodule "3rdparty/clap"]
+	path = 3rdparty/clap
+	url = https://github.com/free-audio/clap
+[submodule "3rdparty/xtensor"]
+	path = 3rdparty/xtensor
+	url = https://github.com/xtensor-stack/xtensor
+[submodule "3rdparty/xsimd"]
+	path = 3rdparty/xsimd
+	url = https://github.com/xtensor-stack/xsimd
+[submodule "3rdparty/xtl"]
+	path = 3rdparty/xtl
+	url = https://github.com/xtensor-stack/xtl
+[submodule "3rdparty/opengametools"]
+	path = 3rdparty/opengametools
+	url = https://github.com/jpaver/opengametools

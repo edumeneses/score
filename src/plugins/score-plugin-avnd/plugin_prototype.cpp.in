@@ -1,0 +1,35 @@
+// clang-format off
+#include "@AVND_BASE_TARGET@.hpp"
+
+#include <score/application/ApplicationContext.hpp>
+#include <score/plugins/Interface.hpp>
+#include <score/plugins/qt_interfaces/FactoryInterface_QtInterface.hpp>
+#include <score/plugins/qt_interfaces/PluginRequirements_QtInterface.hpp>
+
+#include <score_plugin_engine.hpp>
+#include <score/plugins/FactorySetup.hpp>
+
+#include <Avnd/Factories.hpp>
+@AVND_ADDITIONAL_CLASSES@
+
+@AVND_BASE_TARGET@::@AVND_BASE_TARGET@() = default;
+@AVND_BASE_TARGET@::~@AVND_BASE_TARGET@() = default;
+
+std::vector<score::InterfaceBase*> @AVND_BASE_TARGET@::factories(
+        const score::ApplicationContext& ctx,
+        const score::InterfaceKey& key) const
+{
+  std::vector<score::InterfaceBase*> fx;
+
+  @AVND_CUSTOM_FACTORIES@
+
+  return fx;
+}
+
+std::vector<score::PluginKey> @AVND_BASE_TARGET@::required() const
+{
+  return {score_plugin_engine::static_key()};
+}
+
+#include <score/plugins/PluginInstances.hpp>
+SCORE_EXPORT_PLUGIN(@AVND_BASE_TARGET@)

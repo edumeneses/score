@@ -1,0 +1,276 @@
+#include <Gfx/Settings/Model.hpp>
+
+#include <score/gfx/OpenGL.hpp>
+#include <score/gfx/Vulkan.hpp>
+
+#include <QGuiApplication>
+
+#include <wobjectimpl.h>
+#include <score/tools/Bind.hpp>
+
+extern "C" {
+#include <libavcodec/codec.h>
+}
+W_OBJECT_IMPL(Gfx::Settings::Model)
+namespace Gfx::Settings
+{
+namespace Parameters
+{
+
+/* logic to restore when it works well with all backends
+#if defined(Q_OS_WIN)
+  return GraphicsApi::D3D11;
+#elif defined(Q_OS_DARWIN)
+  return GraphicsApi::Metal;
+#elif QT_HAS_VULKAN
+  const QString platformName = QGuiApplication::platformName().toLower();
+  if(platformName.contains("gl") || platformName.contains("wayland") || platformName.isEmpty())
+  {
+    return GraphicsApi::OpenGL;
+  }
+
+  return GraphicsApi::Vulkan;
+#else
+  return GraphicsApi::OpenGL;
+#endif
+*/
+
+SETTINGS_PARAMETER_IMPL(GraphicsApi){
+    QStringLiteral("score_plugin_gfx/GraphicsApi"), GraphicsApis{}.OpenGL};
+
+SETTINGS_PARAMETER_IMPL(HardwareDecode){
+    QStringLiteral("score_plugin_gfx/HardwareDecode"), "None"};
+SETTINGS_PARAMETER_IMPL(Rate){QStringLiteral("score_plugin_gfx/Rate"), 60.0};
+SETTINGS_PARAMETER_IMPL(Samples){QStringLiteral("score_plugin_gfx/Samples"), 1};
+SETTINGS_PARAMETER_IMPL(DecodingThreads){
+    QStringLiteral("score_plugin_gfx/DecodingThreads"), 2};
+SETTINGS_PARAMETER_IMPL(VSync){QStringLiteral("score_plugin_gfx/VSync"), true};
+SETTINGS_PARAMETER_IMPL(Buffers){QStringLiteral("score_plugin_gfx/Buffers"), 3};
+
+static auto list()
+{
+  return std::tie(
+      GraphicsApi, HardwareDecode, DecodingThreads, Samples, Rate, VSync, Buffers);
+}
+}
+
+Gfx::Settings::GraphicsApis::operator QStringList() const noexcept
+{
+  QStringList lst;
+#ifndef QT_NO_OPENGL
+  lst += OpenGL;
+#endif
+
+#if QT_HAS_VULKAN
+  lst += Vulkan;
+#endif
+
+#ifdef Q_OS_WIN
+  lst += D3D11;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+  lst += D3D12;
+#endif
+#endif
+
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+  // https://github.com/ossia/score/issues/1807
+  lst += Metal;
+#endif
+  return lst;
+}
+
+Gfx::Settings::HardwareVideoDecoder::operator QStringList() const noexcept
+{
+  QStringList lst;
+  lst += Auto;
+  lst += None;
+
+  if(avcodec_find_decoder_by_name("mjpeg_qsv")
+     || avcodec_find_decoder_by_name("h264_qsv"))
+    lst += QSV;
+
+  if(avcodec_find_decoder_by_name("mjpeg_cuvid")
+     || avcodec_find_decoder_by_name("h264_cuvid"))
+    lst += CUDA;
+
+#if defined(__APPLE__)
+  lst += VideoToolbox;
+#endif
+
+#if defined(__linux__)
+#if defined(__arm__) || defined(__aarch64__)
+  if(auto c = avcodec_find_decoder_by_name("h264_v4l2m2m"))
+    lst += V4L2;
+#endif
+
+  if(avcodec_find_decoder_by_name("h264_vdpau"))
+    lst += VDPAU;
+
+  if(avcodec_find_decoder_by_name("mjpeg_vaapi"))
+    lst += VAAPI;
+#endif
+
+#if defined(_WIN32)
+  lst += DXVA;
+  lst += D3D;
+#if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(58, 29, 100)
+  lst += D3D12;
+#endif
+#endif
+
+#if LIBAVUTIL_VERSION_MAJOR >= 57
+  if(av_hwdevice_find_type_by_name("vulkan") != AV_HWDEVICE_TYPE_NONE)
+    lst += VulkanVideo;
+#endif
+
+  return lst;
+}
+
+static void update_QSG_RHI_BACKEND(const score::gfx::GraphicsApi& api)
+{
+  using enum score::gfx::GraphicsApi;
+  switch(api)
+  {
+    case OpenGL:
+      qputenv("QSG_RHI_BACKEND", "opengl");
+      break;
+    case Vulkan:
+      qputenv("QSG_RHI_BACKEND", "vulkan");
+      break;
+    case Metal:
+      qputenv("QSG_RHI_BACKEND", "metal");
+      break;
+    case D3D11:
+      qputenv("QSG_RHI_BACKEND", "d3d11");
+      break;
+    case D3D12:
+      qputenv("QSG_RHI_BACKEND", "d3d12");
+      break;
+    default:
+      break;
+  }
+}
+
+Model::Model(
+    const UuidKey<score::SettingsDelegateFactory>& k, QSettings& set,
+    const score::ApplicationContext& ctx)
+    : score::SettingsDelegateModel{k, nullptr}
+{
+  score::setupDefaultSettings(set, Parameters::list(), *this);
+
+  const auto apis = GraphicsApis{};
+
+  const auto platform = QGuiApplication::platformName();
+  if(platform == "eglfs")
+    m_GraphicsApi = apis.OpenGL;
+  else if(platform == "vkkhrdisplay")
+    m_GraphicsApi = apis.Vulkan;
+
+  // https://github.com/ossia/score/issues/1807
+#if defined(Q_OS_MACOS) || defined(Q_OS_IOS)
+  m_GraphicsApi = apis.Metal;
+#endif
+
+  qputenv("QT3D_RENDERER", "rhi");
+  if(const auto rhi = qEnvironmentVariable("QSG_RHI_BACKEND").toLower(); !rhi.isEmpty())
+  {
+    // User sets QSG_RHI_BACKEND from env: we respect it initially
+    if(rhi == "opengl") {
+      m_GraphicsApi = apis.OpenGL;
+    } else if(rhi == "vulkan") {
+      m_GraphicsApi = apis.Vulkan;
+    } else if(rhi == "metal") {
+      m_GraphicsApi = apis.Metal;
+    } else if(rhi == "d3d11") {
+      m_GraphicsApi = apis.D3D11;
+    } else if(rhi == "d3d12") {
+      m_GraphicsApi = apis.D3D12;
+    }
+
+    connect(this, &Gfx::Settings::Model::GraphicsApiChanged, this, [this] (const QString& api)
+    {
+      update_QSG_RHI_BACKEND(this->graphicsApiEnum());
+    });
+  }
+  else
+  {
+    // User does not set QSG_RHI_BACKEND: we update it whenever settings
+    // change
+    using enum score::gfx::GraphicsApi;
+    ::bind(*this, Gfx::Settings::Model::p_GraphicsApi{}, this, [this] (const QString& api)
+    {
+      update_QSG_RHI_BACKEND(this->graphicsApiEnum());
+    });
+  }
+}
+
+int Model::resolveSamples(score::gfx::GraphicsApi api) const noexcept
+{
+  // Clamp the user setting against per-API minima. Hardware-level clamping
+  // (vs. QRhi::supportedSampleCounts()) happens later, in createRenderState
+  // once the QRhi instance exists, since the Settings model has no access
+  // to a backend at this point.
+  int s = m_Samples < 1 ? 1 : m_Samples;
+  if(api == score::gfx::D3D12 && s < 2)
+    s = 2; // D3D12 swap chains require at least 2 samples in QRhi
+  return s;
+}
+
+score::gfx::GraphicsApi Model::graphicsApiEnum() const noexcept
+{
+  const auto apis = GraphicsApis{};
+
+  if(m_GraphicsApi == apis.Vulkan)
+  {
+    return score::gfx::Vulkan;
+  }
+  else if(m_GraphicsApi == apis.Metal)
+  {
+    return score::gfx::Metal;
+  }
+  else if(m_GraphicsApi == apis.D3D11)
+  {
+    return score::gfx::D3D11;
+  }
+  else if(m_GraphicsApi == apis.D3D12)
+  {
+    return score::gfx::D3D12;
+  }
+  else
+  {
+    return score::gfx::OpenGL;
+  }
+}
+
+QShaderVersion shaderVersionForAPI(score::gfx::GraphicsApi api) noexcept
+{
+  switch(api)
+  {
+    case score::gfx::OpenGL:
+      return score::GLCapabilities{}.qShaderVersion;
+
+    case score::gfx::Vulkan:
+      // Note: QShaderVersion still hardcoded to 100 in qrhvulkan.cpp as of qt 6.9
+      return QShaderVersion(100);
+
+    case score::gfx::Metal:
+      return QShaderVersion(12);
+
+    case score::gfx::D3D11:
+    case score::gfx::D3D12:
+      return QShaderVersion(50);
+
+    default:
+      return {};
+  }
+  return {};
+}
+
+SCORE_SETTINGS_PARAMETER_CPP(QString, Model, GraphicsApi)
+SCORE_SETTINGS_PARAMETER_CPP(QString, Model, HardwareDecode)
+SCORE_SETTINGS_PARAMETER_CPP(double, Model, Rate)
+SCORE_SETTINGS_PARAMETER_CPP(int, Model, Samples)
+SCORE_SETTINGS_PARAMETER_CPP(int, Model, DecodingThreads)
+SCORE_SETTINGS_PARAMETER_CPP(bool, Model, VSync)
+SCORE_SETTINGS_PARAMETER_CPP(int, Model, Buffers)
+}

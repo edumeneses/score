@@ -1,0 +1,322 @@
+#include "BufferToGeometry.hpp"
+
+#include "GeometryToBufferStrategies.hpp"
+
+#include <Threedim/Debug.hpp>
+
+#include <cstring>
+
+namespace Threedim
+{
+
+namespace
+{
+
+// Convert location int to attribute_semantic enum
+[[nodiscard]] constexpr halp::attribute_semantic
+toHalpLocation(int32_t loc, bool instanced) noexcept
+{
+  if(!instanced)
+  {
+    switch(loc)
+    {
+      case 0: return halp::attribute_semantic::position;
+      case 1: return halp::attribute_semantic::texcoord0;
+      case 2: return halp::attribute_semantic::color0;
+      case 3: return halp::attribute_semantic::normal;
+      case 4: return halp::attribute_semantic::tangent;
+      default: return halp::attribute_semantic::custom;
+    }
+  }
+  else
+  {
+    switch(loc)
+    {
+      case 0: return halp::attribute_semantic::translation;
+      case 1: return halp::attribute_semantic::texcoord0;
+      case 2: return halp::attribute_semantic::color0;
+      case 3: return halp::attribute_semantic::rotation;
+      case 4: return halp::attribute_semantic::scale;
+      default: return halp::attribute_semantic::custom;
+    }
+  }
+}
+
+} // anonymous namespace
+
+BuffersToGeometry::BuffersToGeometry()
+{
+  // Initialize transform to identity
+  std::memset(outputs.geometry.transform, 0, sizeof(outputs.geometry.transform));
+  outputs.geometry.transform[0] = 1.0f;
+  outputs.geometry.transform[5] = 1.0f;
+  outputs.geometry.transform[10] = 1.0f;
+  outputs.geometry.transform[15] = 1.0f;
+}
+
+void BuffersToGeometry::operator()()
+{
+  auto& mesh = outputs.geometry.mesh;
+  auto& out = outputs.geometry;
+
+  // Collect input buffers into array for indexed access
+  std::array<const halp::gpu_buffer*, 8> inputBuffers = {
+      &inputs.buffer_0.buffer, &inputs.buffer_1.buffer, &inputs.buffer_2.buffer,
+      &inputs.buffer_3.buffer, &inputs.buffer_4.buffer, &inputs.buffer_5.buffer,
+      &inputs.buffer_6.buffer, &inputs.buffer_7.buffer,
+  };
+
+  // Helper to read attribute config by index
+  struct AttributeConfig
+  {
+    bool enabled;
+    int32_t buffer;
+    int32_t offset;
+    int32_t stride;
+    AttributeFormat format;
+    int32_t location;
+    bool instanced;
+  };
+
+  auto getAttributeConfig = [&](int i) -> AttributeConfig {
+    switch(i)
+    {
+#define CASE(n)                                 \
+  case n:                                       \
+    return {                                    \
+        inputs.attribute_buffer_##n.value >= 0, \
+        inputs.attribute_buffer_##n.value,      \
+        inputs.attribute_offset_##n.value,      \
+        inputs.attribute_stride_##n.value,      \
+        inputs.format_##n.value,                \
+        inputs.location_##n.value,              \
+        inputs.instanced_##n.value};
+      CASE(0)
+      CASE(1)
+      CASE(2)
+      CASE(3)
+      CASE(4)
+      CASE(5)
+      CASE(6)
+      CASE(7)
+#undef CASE
+      default:
+        return {};
+    }
+  };
+
+  // Check if anything changed
+  bool meshChanged = false;
+  bool buffersChanged = false;
+  bool transformChanged = false;
+
+  // Check transform changes
+  // (Assuming PositionControl, RotationControl, ScaleControl have .value members)
+  // You'll need to compute the transform matrix and compare
+  // For now, mark as changed if any transform input changed
+  transformChanged = true; // Simplified - compute properly based on your controls
+
+  // Check mesh configuration changes
+  if(inputs.vertices.value != m_prevVertices || inputs.topology.value != m_prevTopology
+     || inputs.cull_mode.value != m_prevCullMode
+     || inputs.front_face.value != m_prevFrontFace
+     || inputs.index_buffer.value != m_prevUseIndexBuffer
+     || ((inputs.index_buffer.value >= 0)
+         && (inputs.index_format.value != m_prevIndexFormat
+             || inputs.index_offset.value != m_prevIndexOffset)))
+  {
+    meshChanged = true;
+  }
+
+  // Check attribute changes
+  for(int i = 0; i < 8; ++i)
+  {
+    auto cfg = getAttributeConfig(i);
+    auto& prev = m_prevAttributes[i];
+
+    if(cfg.enabled != prev.enabled || cfg.buffer != prev.buffer
+       || cfg.offset != prev.offset || cfg.stride != prev.stride
+       || cfg.format != prev.format || cfg.location != prev.location
+       || cfg.instanced != prev.instanced)
+    {
+      meshChanged = true;
+      prev = {cfg.enabled, cfg.buffer,   cfg.offset,   cfg.stride,
+              cfg.format,  cfg.location, cfg.instanced};
+    }
+  }
+  for(int i = 0; i < 8; ++i)
+  {
+    if(inputBuffers[i]->handle != m_prevBuffers[i].handle)
+    {
+      buffersChanged = true;
+      m_prevBuffers[i] = *inputBuffers[i];
+      // FIXME changed?
+    }
+  }
+
+  // Update cached state
+  m_prevVertices = inputs.vertices.value;
+  m_prevTopology = inputs.topology.value;
+  m_prevCullMode = inputs.cull_mode.value;
+  m_prevFrontFace = inputs.front_face.value;
+  m_prevUseIndexBuffer = inputs.index_buffer.value;
+  m_prevIndexFormat = inputs.index_format.value;
+  m_prevIndexOffset = inputs.index_offset.value;
+
+  out.dirty_transform = transformChanged;
+
+  if(!meshChanged && !buffersChanged)
+  {
+    out.dirty_mesh = false;
+    for(auto& out_buf : out.mesh.buffers)
+    {
+      for(auto& in_buf : inputBuffers)
+      {
+        if(in_buf->handle == out_buf.handle)
+        {
+          out_buf.dirty = in_buf->changed;
+          break;
+        }
+      }
+    }
+    return;
+  }
+
+  // Build the geometry
+  mesh.buffers.clear();
+  mesh.bindings.clear();
+  mesh.attributes.clear();
+  mesh.input.clear();
+
+  // Track which input buffers are used and map them to output buffer indices
+  std::array<int, 8> bufferMapping{};
+  std::fill(bufferMapping.begin(), bufferMapping.end(), -1);
+
+  // First pass: load buffers
+  // If some buffers are missing, we ain't sending any geometry
+  for(int i = 0; i < 8; ++i)
+  {
+    auto cfg = getAttributeConfig(i);
+    if(!cfg.enabled)
+      continue;
+
+    const int bufIdx = cfg.buffer;
+    if(bufIdx < 0 || bufIdx >= 8)
+      continue;
+
+    const auto* srcBuf = inputBuffers[bufIdx];
+    if(!srcBuf || !srcBuf->handle)
+    {
+      // Null buffer somewhere
+      m_prevVertices = -1; // to force reanalysis
+      return;
+    }
+  }
+
+  // Now we know we have good buffers
+  for(int i = 0; i < 8; ++i)
+  {
+    auto cfg = getAttributeConfig(i);
+    if(!cfg.enabled)
+      continue;
+
+    const int bufIdx = cfg.buffer;
+    const auto* srcBuf = inputBuffers[bufIdx];
+
+    // Check if this buffer is already added
+    if(bufferMapping[bufIdx] < 0)
+    {
+      bufferMapping[bufIdx] = static_cast<int>(mesh.buffers.size());
+      mesh.buffers.push_back(
+          halp::geometry_gpu_buffer{
+              .handle = srcBuf->handle, .byte_size = srcBuf->byte_size, .dirty = true});
+    }
+  }
+
+  mesh.vertices = inputs.vertices.value;
+  mesh.instances = inputs.instances.value;
+  // FIXME indices if indexed
+  mesh.topology = toHalpTopology(inputs.topology.value);
+  mesh.cull_mode = toHalpCullMode(inputs.cull_mode.value);
+  mesh.front_face = toHalpFrontFace(inputs.front_face.value);
+
+  // Second pass: create bindings, attributes, and inputs
+  // Each enabled attribute gets its own binding (simplest approach)
+  for(int i = 0; i < 8; ++i)
+  {
+    auto cfg = getAttributeConfig(i);
+    if(!cfg.enabled)
+      continue;
+
+    const int bufIdx = cfg.buffer;
+    if(bufIdx < 0 || bufIdx >= 8 || bufferMapping[bufIdx] < 0)
+      continue;
+
+    const auto* srcBuf = inputBuffers[bufIdx];
+    if(!srcBuf || !srcBuf->handle)
+      continue;
+
+    const int bindingIndex = static_cast<int>(mesh.bindings.size());
+    const int attrSize = attributeFormatSize(cfg.format);
+
+    // If stride is 0, default to attribute size (tightly packed)
+    const int stride = (cfg.stride > 0) ? cfg.stride : attrSize;
+
+    // Add binding
+    mesh.bindings.push_back(
+        {.stride = stride,
+         .step_rate = 1,
+         .classification = toHalpClassification(cfg.instanced)});
+
+    // Add attribute
+    mesh.attributes.push_back(
+        halp::geometry_attribute{
+            .binding = bindingIndex,
+            .semantic = toHalpLocation(cfg.location, cfg.instanced),
+            .format = toHalpFormat(cfg.format),
+            .byte_offset = 0 // Offset within stride is 0 since we use input offset
+        });
+
+    // Add input (maps binding to buffer + offset)
+    mesh.input.push_back(
+        halp::geometry_input{
+            .buffer = bufferMapping[bufIdx],
+            .byte_offset
+            = cfg.offset
+              + srcBuf->byte_offset // Combine attribute offset with buffer view offset
+        });
+  }
+
+  // Setup index buffer if enabled
+  if(inputs.index_buffer.value >= 0 && inputs.index_buffer.value < 8)
+  {
+    const auto& idxBuf = *inputBuffers[inputs.index_buffer.value];
+    if(idxBuf.handle && idxBuf.byte_size > 0)
+    {
+      // Add index buffer to buffers array
+      const int idxBufIndex = static_cast<int>(mesh.buffers.size());
+      mesh.buffers.push_back(
+          halp::geometry_gpu_buffer{
+              .handle = idxBuf.handle, .byte_size = idxBuf.byte_size, .dirty = true});
+
+      mesh.index.buffer = idxBufIndex;
+      mesh.index.byte_offset = inputs.index_offset.value + idxBuf.byte_offset;
+      mesh.index.format = toHalpIndexFormat(inputs.index_format.value);
+    }
+    else
+    {
+      mesh.index.buffer = -1;
+      mesh.index.byte_offset = 0;
+    }
+  }
+  else
+  {
+    mesh.index.buffer = -1;
+    mesh.index.byte_offset = 0;
+  }
+
+  out.dirty_mesh = meshChanged;
+  out.dirty_transform = transformChanged;
+}
+
+} // namespace Threedim

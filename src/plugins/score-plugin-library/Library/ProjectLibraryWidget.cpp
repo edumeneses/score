@@ -1,0 +1,108 @@
+#include "ProjectLibraryWidget.hpp"
+
+#include <Library/FileSystemModel.hpp>
+#include <Library/ItemModelFilterLineEdit.hpp>
+#include <Library/LibrarySettings.hpp>
+#include <Library/LibraryWidget.hpp>
+#include <Library/RecursiveFilterProxy.hpp>
+
+#include <score/application/GUIApplicationContext.hpp>
+#include <score/widgets/HelpInteraction.hpp>
+#include <score/widgets/MarginLess.hpp>
+
+#include <core/document/Document.hpp>
+#include <core/presenter/DocumentManager.hpp>
+
+#include <QVBoxLayout>
+
+namespace Library
+{
+
+ProjectLibraryWidget::ProjectLibraryWidget(
+    const score::GUIApplicationContext& ctx, QWidget* parent)
+    : QWidget{parent}
+    , m_model{new FileSystemModel{ctx, this}}
+    , m_proxy{new FileSystemRecursiveFilterProxy{this}}
+{
+  m_proxy->setRecursiveFilteringEnabled(true);
+
+  auto lay = new score::MarginLess<QVBoxLayout>;
+  setStatusTip(
+      QObject::tr("This panel shows the project library.\n"
+                  "It lists the files in the folder where the score is saved."));
+
+  this->setLayout(lay);
+
+  m_proxy->setSourceModel(m_model);
+  m_proxy->setFilterKeyColumn(0);
+  lay->addWidget(new ItemModelFilterLineEdit{*m_proxy, m_tv, this});
+  lay->addWidget(&m_tv);
+  m_tv.setModel(m_proxy);
+  m_tv.setUniformRowHeights(true);
+  setup_treeview(m_tv);
+  connect(&m_tv, &QTreeView::doubleClicked, this, [&](const QModelIndex& idx) {
+    auto doc = ctx.docManager.currentDocument();
+    if(!doc)
+      return;
+
+    auto path = m_model->filePath(m_proxy->mapToSource(idx));
+    for(auto lib : libraryInterface(path))
+    {
+      if(lib->onDoubleClick(path, doc->context()))
+        return;
+    }
+  });
+  m_tv.setAcceptDrops(true);
+  m_tv.setSelectionMode(QAbstractItemView::SelectionMode::ExtendedSelection);
+  m_tv.setContextMenuPolicy(Qt::CustomContextMenu);
+  setupFilesystemContextMenu(m_tv, *m_model, *m_proxy);
+}
+
+ProjectLibraryWidget::~ProjectLibraryWidget() { }
+
+void ProjectLibraryWidget::unsetRoot()
+{
+  QObject::disconnect(m_con);
+  m_tv.setModel(nullptr);
+}
+
+void ProjectLibraryWidget::setRoot(score::DocumentMetadata& meta)
+{
+  auto setFilename = [this](const QString& path) {
+    if(!path.isEmpty())
+    {
+      auto idx = m_model->setRootPath(path);
+
+      m_tv.setModel(m_proxy);
+      m_tv.setRootIndex(m_proxy->mapFromSource(idx));
+      for(int i = 1; i < m_model->columnCount(); ++i)
+        m_tv.hideColumn(i);
+    }
+    else
+    {
+      m_tv.setModel(nullptr);
+    }
+  };
+  QObject::disconnect(m_con);
+  m_con = con(
+      meta, &score::DocumentMetadata::fileNameChanged, this,
+      [=](const QString& filename) {
+    auto fi = QFileInfo{filename};
+    if(fi.exists())
+    {
+      auto path = fi.absolutePath();
+      setFilename(path);
+    }
+      },
+      Qt::QueuedConnection);
+
+  if(auto projectPath = meta.projectFolder(); !projectPath.isEmpty())
+  {
+    setFilename(projectPath);
+  }
+  else
+  {
+    m_tv.setModel(nullptr);
+  }
+}
+}

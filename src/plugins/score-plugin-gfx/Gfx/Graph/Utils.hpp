@@ -1,0 +1,438 @@
+#pragma once
+#include <Process/Dataflow/CableData.hpp>
+
+#include <Gfx/Graph/Mesh.hpp>
+#include <Gfx/Graph/RenderState.hpp>
+#include <Gfx/Graph/Scale.hpp>
+#include <Gfx/Graph/Uniforms.hpp>
+
+#include <ossia/detail/hash_map.hpp>
+#include <ossia/detail/small_flat_map.hpp>
+
+#include <score_plugin_gfx_export.h>
+
+#include <span>
+
+namespace score::gfx
+{
+class Node;
+class NodeModel;
+struct Port;
+struct Edge;
+class RenderList;
+/**
+ * @brief Stores a sampler and the texture currently associated with it.
+ */
+struct Sampler
+{
+  QRhiSampler* sampler{};
+  QRhiTexture* texture{};
+};
+
+/**
+ * @brief Data model for audio data being sent to the GPU
+ */
+struct AudioTexture
+{
+  ossia::hash_map<RenderList*, Sampler> samplers;
+
+  std::vector<float> data;
+  int channels{};
+  int fixedSize{0};
+  enum Mode
+  {
+    Waveform,
+    FFT,
+    Histogram
+  } mode{};
+};
+
+/**
+ * @brief Port of a score::gfx::Node
+ */
+struct Port
+{
+  //! Parent node of the port
+  score::gfx::Node* node{};
+
+  //! Pointer to the corresponding data.
+  void* value{};
+
+  //! Type of the value
+  Types type{};
+
+  //! Optional setting flags
+  Flag flags{};
+
+  //! Edges connected to that port.
+  std::vector<Edge*> edges;
+};
+
+/**
+ * @brief Connection between two score::gfx::Port
+ */
+struct Edge
+{
+  Edge(Port* source, Port* sink, Process::CableType t)
+      : source{source}
+      , sink{sink}
+      , type{t}
+  {
+    source->edges.push_back(this);
+    sink->edges.push_back(this);
+  }
+
+  ~Edge()
+  {
+    if(auto it = std::find(source->edges.begin(), source->edges.end(), this);
+       it != source->edges.end())
+      source->edges.erase(it);
+    if(auto it = std::find(sink->edges.begin(), sink->edges.end(), this);
+       it != sink->edges.end())
+      sink->edges.erase(it);
+  }
+
+  Port* source{};
+  Port* sink{};
+  Process::CableType type{};
+};
+
+/**
+ * @brief Useful abstraction for storing a graphics pipeline and associated resource bindings.
+ */
+struct Pipeline
+{
+  QRhiGraphicsPipeline* pipeline{};
+  QRhiShaderResourceBindings* srb{};
+
+  void release()
+  {
+    delete pipeline;
+    pipeline = nullptr;
+
+    delete srb;
+    srb = nullptr;
+  }
+};
+
+/**
+ * @brief Useful abstraction for storing all the data related to a render target.
+ */
+struct TextureRenderTarget
+{
+  QRhiTexture* texture{};                              // Primary color attachment (location 0)
+  std::vector<QRhiTexture*> additionalColorTextures;   // MRT: locations 1..N
+  QRhiRenderBuffer* colorRenderBuffer{};
+  QRhiRenderBuffer* depthRenderBuffer{};
+  QRhiTexture* depthTexture{};                         // Sampleable depth (alternative to depthRenderBuffer)
+  QRhiTexture* msDepthTexture{};                       // MSAA depth attachment when depthTexture is the resolve target
+  QRhiRenderPassDescriptor* renderPass{};
+  QRhiRenderTarget* renderTarget{};
+
+  operator bool() const noexcept { return texture != nullptr; }
+
+  int colorAttachmentCount() const noexcept
+  {
+    return texture ? 1 + (int)additionalColorTextures.size() : 0;
+  }
+
+  // Returns the actual MSAA sample count of this render target, or -1 if it
+  // cannot be determined from the stored fields (e.g. when only renderPass is
+  // set, as for placeholders that target a swap chain). Callers must treat
+  // -1 as "unknown — fall back to the renderlist's global sample count".
+  // This value is the authoritative input to QRhiGraphicsPipeline::setSampleCount()
+  // when known, since an RT may have been degraded (samplable-depth + MSAA
+  // without depth-resolve support).
+  int sampleCount() const noexcept
+  {
+    if(renderTarget)
+      return renderTarget->sampleCount();
+    if(colorRenderBuffer)
+      return colorRenderBuffer->sampleCount();
+    if(texture)
+      return texture->sampleCount();
+    return -1;
+  }
+
+  void release()
+  {
+    if(texture)
+    {
+      delete texture;
+      texture = nullptr;
+
+      for(auto* t : additionalColorTextures)
+        delete t;
+      additionalColorTextures.clear();
+
+      delete colorRenderBuffer;
+      colorRenderBuffer = nullptr;
+
+      delete depthRenderBuffer;
+      depthRenderBuffer = nullptr;
+
+      delete depthTexture;
+      depthTexture = nullptr;
+
+      delete msDepthTexture;
+      msDepthTexture = nullptr;
+
+      delete renderPass;
+      renderPass = nullptr;
+
+      delete renderTarget;
+      renderTarget = nullptr;
+    }
+  }
+};
+
+/**
+ * @brief Image data and metadata.
+ */
+struct Image
+{
+  QString path;
+  std::vector<QImage> frames;
+};
+
+/**
+ * @brief Create a render target from a texture.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+TextureRenderTarget
+createRenderTarget(const RenderState& state, QRhiTexture* tex, int samples, bool depth, bool samplableDepth = false);
+
+/**
+ * @brief Create a render target from a texture format and size.
+ *
+ * This function will also create a texture.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+TextureRenderTarget createRenderTarget(
+    const RenderState& state, QRhiTexture::Format fmt, QSize sz, int samples, bool depth,
+    bool samplableDepth = false, QRhiTexture::Flags flags = {});
+
+/**
+ * @brief Create a render target with multiple color attachments and optional sampleable depth.
+ *
+ * @param colorTextures All color attachment textures (must be non-empty, first becomes primary)
+ * @param depthTexture Sampleable depth texture, or nullptr for no depth / renderbuffer depth
+ */
+SCORE_PLUGIN_GFX_EXPORT
+TextureRenderTarget createRenderTarget(
+    const RenderState& state,
+    std::span<QRhiTexture* const> colorTextures,
+    QRhiTexture* depthTexture,
+    int samples);
+
+SCORE_PLUGIN_GFX_EXPORT
+void replaceBuffer(QRhiShaderResourceBindings&, int binding, QRhiBuffer* newBuffer);
+SCORE_PLUGIN_GFX_EXPORT
+void replaceSampler(QRhiShaderResourceBindings&, int binding, QRhiSampler* newSampler);
+SCORE_PLUGIN_GFX_EXPORT
+void replaceTexture(QRhiShaderResourceBindings&, int binding, QRhiTexture* newTexture);
+
+SCORE_PLUGIN_GFX_EXPORT
+void replaceBuffer(
+    std::vector<QRhiShaderResourceBinding>&, int binding, QRhiBuffer* newBuffer);
+SCORE_PLUGIN_GFX_EXPORT
+void replaceSampler(
+    std::vector<QRhiShaderResourceBinding>&, int binding, QRhiSampler* newSampler);
+SCORE_PLUGIN_GFX_EXPORT
+void replaceTexture(
+    std::vector<QRhiShaderResourceBinding>&, int binding, QRhiTexture* newTexture);
+
+/**
+ * @brief Replace a sampler.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+void replaceSampler(
+    QRhiShaderResourceBindings&, QRhiSampler* oldSampler, QRhiSampler* newSampler);
+
+/**
+ * @brief Replace the texture currently bound to a sampler.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+void replaceTexture(
+    QRhiShaderResourceBindings&, QRhiSampler* sampler, QRhiTexture* newTexture);
+
+/**
+ * @brief Replace both sampler and texture in a SRC
+ */
+SCORE_PLUGIN_GFX_EXPORT
+void replaceSamplerAndTexture(
+    QRhiShaderResourceBindings&, QRhiSampler* oldSampler, QRhiSampler* newSampler,
+    QRhiTexture* newTexture);
+
+/**
+ * @brief Replace a texture by another in a set of bindings.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+void replaceTexture(
+    QRhiShaderResourceBindings& srb, QRhiTexture* old_tex, QRhiTexture* new_tex);
+/**
+ * @brief Create bindings following the score conventions for shaders and materials.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+QRhiShaderResourceBindings* createDefaultBindings(
+    const RenderList& renderer, const TextureRenderTarget& rt, QRhiBuffer* processUBO,
+    QRhiBuffer* materialUBO, std::span<const Sampler> samplers,
+    std::span<QRhiShaderResourceBinding> additionalBindings = {});
+
+/**
+ * @brief Remap a pipeline's vertex input layout using semantic matching.
+ *
+ * For each shader input variable, resolves its name to an attribute semantic,
+ * finds the matching attribute in the geometry, then creates a vertex input
+ * attribute with binding/format/offset from the geometry and location from
+ * the shader. Returns true on success, false if a required attribute is missing.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+bool remapPipelineVertexInputs(
+    QRhiGraphicsPipeline& pip, const QShader& vertexShader,
+    const ossia::geometry& geom);
+
+/**
+ * @brief Create a render pipeline following the score conventions for shaders and materials.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+Pipeline buildPipeline(
+    const RenderList& renderer, const Mesh& mesh, const QShader& vertexS,
+    const QShader& fragmentS, const TextureRenderTarget& rt, QRhiBuffer* processUBO,
+    QRhiBuffer* materialUBO, std::span<const Sampler> samplers,
+    std::span<QRhiShaderResourceBinding> additionalBindings = {});
+
+/**
+ * @brief Get a pair of compiled vertex / fragment shaders from GLSL 4.5 sources.
+ *
+ * Note: this function will throw if a shader is invalid.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+std::pair<QShader, QShader>
+makeShaders(const RenderState& v, QString vert, QString frag);
+
+/**
+ * @brief Compile a compute shader.
+ *
+ * Note: this function will throw if the shader is invalid.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+QShader makeCompute(const RenderState& v, QString compt);
+
+/**
+ * @brief Utility to represent a shader material following score conventions.
+ *
+ * The material is synthesized from the input ports.
+ */
+struct SCORE_PLUGIN_GFX_EXPORT DefaultShaderMaterial
+{
+  void init(
+      RenderList& renderer, const std::vector<Port*>& input,
+      ossia::small_vector<Sampler, 8>& samplers);
+
+  QRhiBuffer* buffer{};
+  int size{};
+};
+
+/**
+ * @brief Resize the size of a texture to fit within GPU limits
+ */
+SCORE_PLUGIN_GFX_EXPORT
+QSize resizeTextureSize(QSize img, int min, int max) noexcept;
+
+/**
+ * @brief Resize a texture to fit within GPU limits
+ */
+SCORE_PLUGIN_GFX_EXPORT
+QImage resizeTexture(const QImage& img, int min, int max) noexcept;
+
+inline void copyMatrix(const QMatrix4x4& mat, float* ptr) noexcept
+{
+  memcpy(ptr, mat.constData(), sizeof(float) * 16);
+}
+inline void copyMatrix(const QMatrix3x3& mat, float* ptr) noexcept
+{
+  memcpy(ptr, mat.constData(), sizeof(float) * 9);
+}
+
+/**
+ * @brief Compute the scale to apply to a texture so that it fits in a GL viewport.
+ */
+SCORE_PLUGIN_GFX_EXPORT
+QSizeF computeScaleForMeshSizing(score::gfx::ScaleMode mode, QSizeF viewport, QSizeF texture);
+
+/**
+ * @brief Compute the scale to apply to a texture rendered to a quad the size of viewport
+ */
+SCORE_PLUGIN_GFX_EXPORT
+QSizeF computeScaleForTexcoordSizing(
+    score::gfx::ScaleMode mode, QSizeF viewport, QSizeF texture);
+
+/**
+ * @brief Schedule a Dynamic buffer update when we can guarantee the buffer outlives the frame.
+ */
+inline void updateDynamicBufferWithStoredData(
+    QRhiResourceUpdateBatch* ub
+  , QRhiBuffer* buf
+  , int offset
+  , int64_t bytesize
+  , const char* data
+  )
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
+  ub->updateDynamicBuffer(buf, offset, QByteArray::fromRawData(data, bytesize));
+#else
+  ub->updateDynamicBuffer(buf, offset, bytesize, data);
+#endif
+}
+
+inline void updateDynamicBufferWithStoredData(
+    QRhiResourceUpdateBatch* ub
+    , QRhiBuffer* buf
+    , int offset
+    , QByteArray b
+    )
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
+  ub->updateDynamicBuffer(buf, offset, std::move(b));
+#else
+  ub->updateDynamicBuffer(buf, offset, b.size(), b.data());
+#endif
+}
+
+/**
+ * @brief Schedule a Static buffer update when we can guarantee the buffer outlives the frame.
+ */
+inline void uploadStaticBufferWithStoredData(
+    QRhiResourceUpdateBatch* ub
+    , QRhiBuffer* buf
+    , int offset
+    , int64_t bytesize
+    , const char* data
+    )
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
+  ub->uploadStaticBuffer(buf, offset, QByteArray::fromRawData(data, bytesize));
+#else
+  ub->uploadStaticBuffer(buf, offset, bytesize, data);
+#endif
+}
+
+inline void uploadStaticBufferWithStoredData(
+    QRhiResourceUpdateBatch* ub
+    , QRhiBuffer* buf
+    , int offset
+    , QByteArray b
+    )
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 10, 0)
+  ub->uploadStaticBuffer(buf, offset, std::move(b));
+#else
+  ub->uploadStaticBuffer(buf, offset, b.size(), b.data());
+#endif
+}
+
+SCORE_PLUGIN_GFX_EXPORT
+std::vector<Sampler> initInputSamplers(
+    const score::gfx::Node& node, RenderList& renderer, const std::vector<Port*>& ports);
+}

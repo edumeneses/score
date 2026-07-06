@@ -1,0 +1,2356 @@
+#include "EffectModel.hpp"
+
+#include <Process/Dataflow/Port.hpp>
+#include <Process/Dataflow/PortFactory.hpp>
+#include <Process/Dataflow/WidgetInlets.hpp>
+
+#include <Scenario/Document/Interval/IntervalModel.hpp>
+
+#include <Audio/Settings/Model.hpp>
+
+#include <score/serialization/DataStreamVisitor.hpp>
+#include <score/serialization/JSONVisitor.hpp>
+#include <score/tools/IdentifierGeneration.hpp>
+
+#include <ossia/dataflow/exec_pool.hpp>
+#include <ossia/detail/json.hpp>
+#include <ossia/detail/thread.hpp>
+#include <ossia/network/domain/domain.hpp>
+
+#include <QDebug>
+#include <QMenu>
+#include <QThread>
+#include <QTimer>
+
+#include <Clap/ApplicationPlugin.hpp>
+#include <Clap/Window.hpp>
+#include <clap/all.h>
+#include <clap/ext/state.h>
+#include <clap/ext/preset-load.h>
+#include <clap/factory/preset-discovery.h>
+
+#include <score_git_info.hpp>
+#include <wobjectimpl.h>
+
+#include <clap/ext/context-menu.h>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+W_OBJECT_IMPL(Clap::Model)
+
+namespace Clap
+{
+
+// Some plug-ins (e.g. Octasine) don't zero-init info.name; reject garbage.
+static QString
+clap_safe_name(const char* raw, const QString& fallback) noexcept
+{
+  if(!raw)
+    return fallback;
+  const auto len = qstrnlen(raw, CLAP_NAME_SIZE);
+  if(len == 0)
+    return fallback;
+  const QString name = QString::fromUtf8(raw, len);
+  if(name.isEmpty())
+    return fallback;
+  qsizetype letters = 0;
+  for(QChar c : name)
+  {
+    if(c == QChar::ReplacementCharacter)
+      return fallback;
+    if(!c.isPrint())
+      return fallback;
+    if(c.isLetter())
+      ++letters;
+  }
+  if(letters < 2 && letters < name.length())
+    return fallback;
+  return name;
+}
+
+// Host GUI callbacks
+extern "C" {
+static void resize_hints_changed(const clap_host_t* host)
+{
+  // Handle resize hints change if needed
+}
+
+static bool request_resize(const clap_host_t* host, uint32_t width, uint32_t height)
+{
+  Clap::Model* model = static_cast<Clap::PluginHandle*>(host->host_data)->model;
+  if(!model)
+    return false;
+  auto* window = model->window;
+  if(window)
+  {
+    window->resize(width, height);
+    return true;
+  }
+  return false;
+}
+
+static bool request_show(const clap_host_t* host)
+{
+  Clap::Model* model = static_cast<Clap::PluginHandle*>(host->host_data)->model;
+  if(!model)
+    return false;
+  auto* window = model->window;
+  if(window)
+  {
+    window->show();
+    return true;
+  }
+  return false;
+}
+
+static bool request_hide(const clap_host_t* host)
+{
+  Clap::Model* model = static_cast<Clap::PluginHandle*>(host->host_data)->model;
+  if(!model)
+    return false;
+  auto* window = model->window;
+  if(window)
+  {
+    window->hide();
+    return true;
+  }
+  return false;
+}
+
+static void closed(const clap_host_t* host, bool was_destroyed)
+{
+  Clap::Model* model = static_cast<Clap::PluginHandle*>(host->host_data)->model;
+  if(!model)
+    return;
+  auto* window = model->window;
+  if(window && was_destroyed)
+  {
+    // The plugin GUI was destroyed, we need to clean up
+    window->close();
+  }
+}
+
+static std::atomic<uint32_t> g_next_timer_id{};
+bool register_timer(const clap_host_t* host, uint32_t period_ms, clap_id* timer_id)
+{
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model)
+    return false;
+
+  auto tm = new QTimer{};
+  tm->setInterval(period_ms);
+  *timer_id = g_next_timer_id.fetch_add(1, std::memory_order_relaxed);
+  QObject::connect(
+      tm, &QTimer::timeout, m.model,
+      [h = std::weak_ptr{m.model->handle()}, tid = *timer_id] {
+    if(auto hh = h.lock())
+      if(auto t = hh->ext_timer_support)
+        t->on_timer(hh->plugin, tid);
+  });
+  m.model->timers.push_back({*timer_id, tm});
+  tm->start();
+  return true;
+}
+
+// Returns true on success.
+// [main-thread]
+bool unregister_timer(const clap_host_t* host, clap_id timer_id)
+{
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model)
+    return false;
+  for(auto it = m.model->timers.begin(); it != m.model->timers.end(); ++it)
+  {
+    if(it->first == timer_id)
+    {
+      delete it->second;
+      m.model->timers.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+// POSIX fd support host extension
+bool register_fd(const clap_host_t* host, int fd, clap_posix_fd_flags_t flags)
+{
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model)
+    return false;
+
+  // Check if fd is already registered
+  auto it = m.model->fd_notifiers.find(fd);
+  if(it != m.model->fd_notifiers.end())
+  {
+    qWarning() << "CLAP: Attempted to register already registered fd" << fd;
+    return false;
+  }
+
+  // Create notifier structure
+  auto notifiers = std::make_unique<Model::FdNotifiers>();
+
+  // Set up read notifier
+  if(flags & CLAP_POSIX_FD_READ)
+  {
+    notifiers->read = std::make_unique<QSocketNotifier>(fd, QSocketNotifier::Read);
+    QObject::connect(
+        notifiers->read.get(), &QSocketNotifier::activated, m.model,
+        [handle = std::weak_ptr{m.model->handle()}, fd]() {
+      if(auto h = handle.lock())
+        if(auto* plugin_fd_ext = static_cast<const clap_plugin_posix_fd_support_t*>(
+               h->plugin->get_extension(h->plugin, CLAP_EXT_POSIX_FD_SUPPORT)))
+        {
+          plugin_fd_ext->on_fd(h->plugin, fd, CLAP_POSIX_FD_READ);
+        }
+    });
+    notifiers->read->setEnabled(true);
+  }
+
+  // Set up write notifier
+  if(flags & CLAP_POSIX_FD_WRITE)
+  {
+    notifiers->write = std::make_unique<QSocketNotifier>(fd, QSocketNotifier::Write);
+    QObject::connect(
+        notifiers->write.get(), &QSocketNotifier::activated, m.model,
+        [handle = std::weak_ptr{m.model->handle()}, fd]() {
+      if(auto h = handle.lock())
+        if(auto* plugin_fd_ext = static_cast<const clap_plugin_posix_fd_support_t*>(
+               h->plugin->get_extension(h->plugin, CLAP_EXT_POSIX_FD_SUPPORT)))
+        {
+          plugin_fd_ext->on_fd(h->plugin, fd, CLAP_POSIX_FD_WRITE);
+        }
+    });
+    notifiers->write->setEnabled(true);
+  }
+
+  // Set up error/exception notifier
+  if(flags & CLAP_POSIX_FD_ERROR)
+  {
+    notifiers->error = std::make_unique<QSocketNotifier>(fd, QSocketNotifier::Exception);
+    QObject::connect(
+        notifiers->error.get(), &QSocketNotifier::activated, m.model,
+        [handle = std::weak_ptr{m.model->handle()}, fd]() {
+      if(auto h = handle.lock())
+        if(auto* plugin_fd_ext = static_cast<const clap_plugin_posix_fd_support_t*>(
+               h->plugin->get_extension(h->plugin, CLAP_EXT_POSIX_FD_SUPPORT)))
+        {
+          plugin_fd_ext->on_fd(h->plugin, fd, CLAP_POSIX_FD_ERROR);
+        }
+    });
+    notifiers->error->setEnabled(true);
+  }
+
+  // Store the notifiers
+  m.model->fd_notifiers[fd] = std::move(notifiers);
+  return true;
+}
+
+bool modify_fd(const clap_host_t* host, int fd, clap_posix_fd_flags_t flags)
+{
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model)
+    return false;
+
+  auto it = m.model->fd_notifiers.find(fd);
+  if(it == m.model->fd_notifiers.end())
+  {
+    qWarning() << "CLAP: Attempted to modify unregistered fd" << fd;
+    return false;
+  }
+
+  auto& notifiers = it->second;
+
+  // Update read notifier
+  if(flags & CLAP_POSIX_FD_READ)
+  {
+    if(!notifiers->read)
+    {
+      notifiers->read = std::make_unique<QSocketNotifier>(fd, QSocketNotifier::Read);
+      QObject::connect(
+          notifiers->read.get(), &QSocketNotifier::activated, m.model,
+          [handle = std::weak_ptr{m.model->handle()}, fd]() {
+        if(auto h = handle.lock())
+          if(auto* plugin_fd_ext = static_cast<const clap_plugin_posix_fd_support_t*>(
+                 h->plugin->get_extension(h->plugin, CLAP_EXT_POSIX_FD_SUPPORT)))
+          {
+            plugin_fd_ext->on_fd(h->plugin, fd, CLAP_POSIX_FD_READ);
+          }
+      });
+    }
+    notifiers->read->setEnabled(true);
+  }
+  else if(notifiers->read)
+  {
+    notifiers->read->setEnabled(false);
+  }
+
+  // Update write notifier
+  if(flags & CLAP_POSIX_FD_WRITE)
+  {
+    if(!notifiers->write)
+    {
+      notifiers->write = std::make_unique<QSocketNotifier>(fd, QSocketNotifier::Write);
+      QObject::connect(
+          notifiers->write.get(), &QSocketNotifier::activated, m.model,
+          [handle = std::weak_ptr{m.model->handle()}, fd]() {
+        if(auto h = handle.lock())
+          if(auto* plugin_fd_ext = static_cast<const clap_plugin_posix_fd_support_t*>(
+                 h->plugin->get_extension(h->plugin, CLAP_EXT_POSIX_FD_SUPPORT)))
+          {
+            plugin_fd_ext->on_fd(h->plugin, fd, CLAP_POSIX_FD_WRITE);
+          }
+      });
+    }
+    notifiers->write->setEnabled(true);
+  }
+  else if(notifiers->write)
+  {
+    notifiers->write->setEnabled(false);
+  }
+
+  // Update error notifier
+  if(flags & CLAP_POSIX_FD_ERROR)
+  {
+    if(!notifiers->error)
+    {
+      notifiers->error
+          = std::make_unique<QSocketNotifier>(fd, QSocketNotifier::Exception);
+      QObject::connect(
+          notifiers->error.get(), &QSocketNotifier::activated, m.model,
+          [handle = std::weak_ptr{m.model->handle()}, fd]() {
+        if(auto h = handle.lock())
+          if(auto* plugin_fd_ext = static_cast<const clap_plugin_posix_fd_support_t*>(
+                 h->plugin->get_extension(h->plugin, CLAP_EXT_POSIX_FD_SUPPORT)))
+          {
+            plugin_fd_ext->on_fd(h->plugin, fd, CLAP_POSIX_FD_ERROR);
+          }
+      });
+    }
+    notifiers->error->setEnabled(true);
+  }
+  else if(notifiers->error)
+  {
+    notifiers->error->setEnabled(false);
+  }
+
+  return true;
+}
+
+bool unregister_fd(const clap_host_t* host, int fd)
+{
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model)
+    return false;
+
+  auto it = m.model->fd_notifiers.find(fd);
+  if(it == m.model->fd_notifiers.end())
+  {
+    qWarning() << "CLAP: Attempted to unregister unregistered fd" << fd;
+    return false;
+  }
+
+  // QSocketNotifier objects will be automatically destroyed by unique_ptr
+  m.model->fd_notifiers.erase(it);
+  return true;
+}
+
+static QByteArray readCLAPState(const clap_plugin_t& plugin)
+{
+  QByteArray dat;
+
+  // Get state extension
+  auto state = (const clap_plugin_state_t*)plugin.get_extension(&plugin, CLAP_EXT_STATE);
+  if(!state)
+    return dat;
+
+  // Create a stream to capture the state
+  struct stream_context
+  {
+    QByteArray* data;
+  };
+
+  stream_context ctx{&dat};
+
+  clap_ostream_t stream{};
+  stream.ctx = &ctx;
+  stream.write
+      = [](const clap_ostream_t* stream, const void* buffer, uint64_t size) -> int64_t {
+    auto* ctx = static_cast<stream_context*>(stream->ctx);
+    auto old_size = ctx->data->size();
+    ctx->data->resize(old_size + size);
+    std::memcpy(ctx->data->data() + old_size, buffer, size);
+    return size;
+  };
+
+  // Save plugin state
+  if(!state->save(&plugin, &stream))
+    dat.clear();
+
+  return dat;
+}
+}
+
+static constexpr clap_host_timer_support_t host_timer_ext
+    = {.register_timer = register_timer, .unregister_timer = unregister_timer};
+
+static constexpr clap_host_posix_fd_support_t host_posix_fd_ext = {
+    .register_fd = register_fd, .modify_fd = modify_fd, .unregister_fd = unregister_fd};
+
+static constexpr clap_host_state_t host_state_ext
+    = {.mark_dirty = [](const clap_host_t* host) {
+  // [main-thread] per CLAP spec. The plug-in says its state changed
+  // (typically because the user manipulated its own UI). Forward to the
+  // model, which debounces and snapshots. Plug-ins are known to spam
+  // this — Vital fires it multiple times per knob movement — so the
+  // debounce is mandatory.
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model)
+    return;
+  m.model->markStateDirty();
+}};
+static constexpr clap_host_params_t host_params_ext
+    = {.rescan = [](const clap_host_t* host, clap_param_rescan_flags flags) {
+  // Spec: [main-thread]. Defer — plug-ins may call from state.load().
+  if(!host || !host->host_data)
+    return;
+  auto& h = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!h.model)
+    return;
+  QMetaObject::invokeMethod(h.model, [model = QPointer<Model>{h.model}, flags] {
+    if(model)
+      model->onParamRescan(flags);
+  }, Qt::AutoConnection);
+}, .clear = [](const clap_host_t* host, clap_id param_id, clap_param_clear_flags flags) {
+  // TODO
+  //  qDebug(Q_FUNC_INFO);
+}, .request_flush = [](const clap_host_t* host) {
+  //  qDebug(Q_FUNC_INFO);
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model)
+    return;
+
+  // Per CLAP spec, request_flush is [thread-safe, !audio-thread] and the host
+  // must SCHEDULE a call to flush() — not invoke it inline. Plugins sometimes
+  // call request_flush from inside their own state.load() / flush() / GUI
+  // event handler, so calling flushFromPluginToHost synchronously here could
+  // reenter clap_plugin_params.flush().
+  QMetaObject::invokeMethod(m.model, [model = QPointer<Model>{m.model}] {
+    if(model && !model->executing())
+      model->flushFromPluginToHost();
+  }, Qt::QueuedConnection);
+}};
+
+static constexpr clap_host_gui_t host_gui_ext
+    = {.resize_hints_changed = resize_hints_changed,
+       .request_resize = request_resize,
+       .request_show = request_show,
+       .request_hide = request_hide,
+       .closed = closed};
+
+// [main-thread] — plug-in queries the enclosing track's name/colour. We
+// look up the closest parent interval and report its metadata. This is
+// what AIDA-X et al. show in the title bar.
+static constexpr clap_host_track_info_t host_track_info_ext
+    = {.get = [](const clap_host_t* host, clap_track_info_t* info) -> bool {
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model || !info)
+    return false;
+  auto* parent = Scenario::closestParentInterval(m.model);
+  if(!parent)
+    return false;
+  info->flags = CLAP_TRACK_INFO_HAS_TRACK_NAME | CLAP_TRACK_INFO_HAS_TRACK_COLOR;
+  auto& meta = parent->metadata();
+  std::string name;
+  if(!meta.getLabel().isEmpty())
+    name = meta.getLabel().toStdString();
+  else if(!meta.getName().isEmpty())
+    name = meta.getName().toStdString();
+
+  std::strncpy(info->name, name.c_str(), CLAP_NAME_SIZE - 1);
+  if(name.size() < CLAP_NAME_SIZE)
+    info->name[name.size()] = 0;
+  else
+    info->name[CLAP_NAME_SIZE - 1] = 0;
+
+  QRgb col = meta.getColor().getBrush().color().rgba();
+  info->color = clap_color_t{
+      .alpha = (uint8_t)qAlpha(col),
+      .red = (uint8_t)qRed(col),
+      .green = (uint8_t)qGreen(col),
+      .blue = (uint8_t)qBlue(col)};
+  return true;
+}};
+
+static constexpr clap_host_event_registry_t host_event_registry_ext
+    = {.query = [](const clap_host_t* host, const char* space_name,
+                   uint16_t* space_id) -> bool {
+  *space_id = UINT16_MAX;
+  return false;
+}};
+
+static constexpr clap_host_latency_t host_latency_ext
+    = {.changed = [](const clap_host_t* host) {
+  // TODO
+}};
+
+static constexpr clap_host_log_t host_log_ext
+    = {.log = [](const clap_host_t* host, clap_log_severity severity, const char* msg) {
+  switch(severity)
+  {
+    case CLAP_LOG_DEBUG:
+      qDebug() << msg;
+      break;
+    case CLAP_LOG_INFO:
+      qInfo() << msg;
+      break;
+    case CLAP_LOG_WARNING:
+      qWarning() << msg;
+      break;
+    case CLAP_LOG_HOST_MISBEHAVING:
+    case CLAP_LOG_PLUGIN_MISBEHAVING:
+    case CLAP_LOG_ERROR:
+      qCritical() << msg;
+      break;
+    case CLAP_LOG_FATAL:
+      qFatal("%s", msg);
+      break;
+  }
+}};
+
+static constexpr clap_host_note_name_t host_note_name_ext
+    = {.changed = [](const clap_host_t* host) {
+  // TODO
+}};
+
+static constexpr clap_host_preset_load_t host_preset_load_ext
+    = {.on_error =
+           [](const clap_host_t* host, uint32_t location_kind, const char* location,
+              const char* load_key, int32_t os_error, const char* msg) {
+  qWarning() << "CLAP preset load error:" << (msg ? msg : "Unknown error")
+             << "Location:" << (location ? location : "null")  
+             << "Load key:" << (load_key ? load_key : "null")
+             << "OS error:" << os_error;
+},
+       .loaded = [](const clap_host_t* host, uint32_t location_kind,
+                    const char* location, const char* load_key) {
+  qDebug() << "CLAP preset loaded successfully:"
+           << "Location:" << (location ? location : "null")
+           << "Load key:" << (load_key ? load_key : "null");
+}};
+
+static constexpr clap_host_remote_controls_t host_remote_control_ext
+    = {.changed = [](const clap_host_t* host) {
+  // qDebug(Q_FUNC_INFO);
+  // TODO
+}, .suggest_page = [](const clap_host_t* host, clap_id page_id) {
+  //  qDebug(Q_FUNC_INFO);
+  // TODO
+}};
+
+static constexpr clap_host_tail_t host_tail_ext
+    = {.changed = [](const clap_host_t* host) {
+  //   qDebug(Q_FUNC_INFO);
+  // TODO
+}};
+
+static constexpr clap_host_thread_check_t host_thread_check_ext = {
+    .is_main_thread = [](const clap_host_t* host) -> bool {
+  return ossia::get_current_thread_type() == ossia::thread_type::Ui;
+},
+    .is_audio_thread = [](const clap_host_t* host) -> bool {
+  // The shared task pool pins its workers as AudioTask; they run plug-in
+  // process() / thread-pool exec() under the audio thread's umbrella, so both
+  // count as "the audio thread" for the plug-in (matches ensure_current_thread_kind).
+  const auto t = ossia::get_current_thread_type();
+  return t == ossia::thread_type::Audio || t == ossia::thread_type::AudioTask;
+},
+};
+
+static constexpr clap_host_thread_pool host_thread_pool_ext
+    = {.request_exec = [](const clap_host_t* host, uint32_t num_tasks) -> bool {
+  if(!host || !host->host_data)
+    return false;
+  auto& h = *static_cast<PluginHandle*>(host->host_data);
+  if(!h.plugin)
+    return false;
+  auto ext = static_cast<const clap_plugin_thread_pool_t*>(
+      h.plugin->get_extension(h.plugin, CLAP_EXT_THREAD_POOL));
+  if(!ext || !ext->exec)
+    return false;
+  if(num_tasks == 0)
+    return false;
+
+  // Synchronous fork-join on the shared realtime pool: workers are RT-pinned
+  // AudioTask threads, the calling (audio) thread participates, and nothing is
+  // allocated here. exec() is C ABI but some plug-ins are C++ inside, so guard
+  // against an escaping exception terminating the audio thread.
+  const clap_plugin_t* plugin = h.plugin;
+  ossia::task_pool::instance().fork_n(
+      static_cast<int>(num_tasks), [plugin, ext](int i) noexcept {
+    try
+    {
+      ext->exec(plugin, static_cast<uint32_t>(i));
+    }
+    catch(...)
+    {
+    }
+  });
+  return true;
+}};
+
+static constexpr clap_host_voice_info_t host_voice_info_ext
+    = {.changed = [](const clap_host_t* host) {
+  //   qDebug(Q_FUNC_INFO);
+  // TODO
+}};
+
+// Context menu builder implementation
+struct context_menu_builder_impl
+{
+  QMenu* menu;
+  QMenu* root_menu;
+  const clap_plugin_t* plugin;
+  const clap_plugin_context_menu_t* plugin_context_menu;
+  const clap_context_menu_target_t* target;
+
+  context_menu_builder_impl(
+      QMenu* m, const clap_plugin_t* p, const clap_plugin_context_menu_t* pcm,
+      const clap_context_menu_target_t* t)
+      : menu(m)
+      , root_menu(m)
+      , plugin(p)
+      , plugin_context_menu(pcm)
+      , target(t)
+  {
+  }
+};
+
+static bool context_menu_add_item(
+    const clap_context_menu_builder_t* builder, clap_context_menu_item_kind_t item_kind,
+    const void* item_data)
+{
+  auto* impl = static_cast<context_menu_builder_impl*>(builder->ctx);
+  if(!impl || !impl->menu)
+    return false;
+
+  switch(item_kind)
+  {
+    case CLAP_CONTEXT_MENU_ITEM_ENTRY: {
+      auto* entry = static_cast<const clap_context_menu_entry_t*>(item_data);
+      auto* action = impl->menu->addAction(QString::fromUtf8(entry->label));
+      action->setEnabled(entry->is_enabled);
+
+      clap_id action_id = entry->action_id;
+      QObject::connect(action, &QAction::triggered, [action_id, builder]() {
+        auto* impl = static_cast<context_menu_builder_impl*>(builder->ctx);
+        if(impl && impl->plugin_context_menu)
+        {
+          impl->plugin_context_menu->perform(impl->plugin, impl->target, action_id);
+        }
+      });
+      return true;
+    }
+
+    case CLAP_CONTEXT_MENU_ITEM_CHECK_ENTRY: {
+      auto* entry = static_cast<const clap_context_menu_check_entry_t*>(item_data);
+      auto* action = impl->menu->addAction(QString::fromUtf8(entry->label));
+      action->setEnabled(entry->is_enabled);
+      action->setCheckable(true);
+      action->setChecked(entry->is_checked);
+
+      clap_id action_id = entry->action_id;
+      QObject::connect(action, &QAction::triggered, [action_id, builder]() {
+        auto* impl = static_cast<context_menu_builder_impl*>(builder->ctx);
+        if(impl && impl->plugin_context_menu)
+        {
+          impl->plugin_context_menu->perform(impl->plugin, impl->target, action_id);
+        }
+      });
+      return true;
+    }
+
+    case CLAP_CONTEXT_MENU_ITEM_SEPARATOR: {
+      impl->menu->addSeparator();
+      return true;
+    }
+
+    case CLAP_CONTEXT_MENU_ITEM_BEGIN_SUBMENU: {
+      auto* submenu_data = static_cast<const clap_context_menu_submenu_t*>(item_data);
+      auto* submenu = impl->menu->addMenu(QString::fromUtf8(submenu_data->label));
+      submenu->setEnabled(submenu_data->is_enabled);
+      impl->menu = submenu; // Switch context to submenu
+      return true;
+    }
+
+    case CLAP_CONTEXT_MENU_ITEM_END_SUBMENU: {
+      // Switch back to parent menu
+      if(impl->menu != impl->root_menu)
+      {
+        // Find parent menu by traversing up the object hierarchy
+        QObject* parent = impl->menu->parent();
+        while(parent && !qobject_cast<QMenu*>(parent))
+          parent = parent->parent();
+        if(parent)
+          impl->menu = static_cast<QMenu*>(parent);
+        else
+          impl->menu = impl->root_menu;
+      }
+      return true;
+    }
+
+    case CLAP_CONTEXT_MENU_ITEM_TITLE: {
+      auto* title = static_cast<const clap_context_menu_item_title_t*>(item_data);
+      auto* action = impl->menu->addAction(QString::fromUtf8(title->title));
+      action->setEnabled(false); // Titles are not clickable
+      auto font = action->font();
+      font.setBold(true);
+      action->setFont(font);
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool context_menu_supports(
+    const clap_context_menu_builder_t* builder, clap_context_menu_item_kind_t item_kind)
+{
+  // We support all standard context menu item types
+  return item_kind == CLAP_CONTEXT_MENU_ITEM_ENTRY
+         || item_kind == CLAP_CONTEXT_MENU_ITEM_CHECK_ENTRY
+         || item_kind == CLAP_CONTEXT_MENU_ITEM_SEPARATOR
+         || item_kind == CLAP_CONTEXT_MENU_ITEM_BEGIN_SUBMENU
+         || item_kind == CLAP_CONTEXT_MENU_ITEM_END_SUBMENU
+         || item_kind == CLAP_CONTEXT_MENU_ITEM_TITLE;
+}
+
+static constexpr clap_host_context_menu_t host_context_menu_ext = {
+    .populate = [](const clap_host_t* host, const clap_context_menu_target_t* target,
+                   const clap_context_menu_builder_t* builder) -> bool { return true; },
+
+    .perform = [](const clap_host_t* host, const clap_context_menu_target_t* target,
+                  clap_id action_id) -> bool { return false; },
+
+    .can_popup = [](const clap_host_t* host) -> bool { return true; },
+
+    .popup = [](const clap_host_t* host, const clap_context_menu_target_t* target,
+                int32_t screen_index, int32_t x, int32_t y) -> bool {
+  auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+  if(!m.model)
+    return false;
+  auto& model = *m.model;
+  // Get the plugin's context menu extension
+  auto* plugin_context_menu = static_cast<const clap_plugin_context_menu_t*>(
+      m.plugin->get_extension(m.plugin, CLAP_EXT_CONTEXT_MENU));
+
+  if(!plugin_context_menu)
+    return false;
+
+  // Create a QMenu
+  auto menu = std::make_unique<QMenu>();
+
+  // Create builder context
+  context_menu_builder_impl builder_ctx(
+      menu.get(), m.plugin, plugin_context_menu, target);
+  clap_context_menu_builder_t builder
+      = {.ctx = &builder_ctx,
+         .add_item = context_menu_add_item,
+         .supports = context_menu_supports};
+
+  // Let the plugin populate the menu
+  if(!plugin_context_menu->populate(m.plugin, target, &builder))
+    return false;
+
+  // Show the menu at the specified position
+  QPoint pos(x, y);
+  menu->exec(pos);
+
+  return true;
+}};
+
+PluginHandle::PluginHandle()
+{
+  host.clap_version = CLAP_VERSION;
+  host.name = "ossia score";
+  host.vendor = "ossia.io";
+  host.url = "https://ossia.io";
+  host.version = SCORE_TAG_NO_V;
+  host.get_extension
+      = [](const clap_host* host, const char* extension_id) -> const void* {
+    if(strcmp(extension_id, CLAP_EXT_GUI) == 0)
+      return &host_gui_ext;
+    if(strcmp(extension_id, CLAP_EXT_STATE) == 0)
+      return &host_state_ext;
+    if(strcmp(extension_id, CLAP_EXT_PARAMS) == 0)
+      return &host_params_ext;
+    if(strcmp(extension_id, CLAP_EXT_TIMER_SUPPORT) == 0)
+      return &host_timer_ext;
+    if(strcmp(extension_id, CLAP_EXT_POSIX_FD_SUPPORT) == 0)
+      return &host_posix_fd_ext;
+    if(strcmp(extension_id, CLAP_EXT_TRACK_INFO) == 0)
+      return &host_track_info_ext;
+    if(strcmp(extension_id, "clap.track-info.draft/1") == 0)
+      return &host_track_info_ext;
+    if(strcmp(extension_id, CLAP_EXT_EVENT_REGISTRY) == 0)
+      return &host_event_registry_ext;
+    if(strcmp(extension_id, CLAP_EXT_LOG) == 0)
+      return &host_log_ext;
+    if(strcmp(extension_id, CLAP_EXT_LATENCY) == 0)
+      return &host_latency_ext;
+    if(strcmp(extension_id, CLAP_EXT_NOTE_NAME) == 0)
+      return &host_note_name_ext;
+    if(strcmp(extension_id, CLAP_EXT_PRESET_LOAD) == 0)
+      return &host_preset_load_ext;
+    if(strcmp(extension_id, "clap.preset-load.draft/2") == 0)
+      return &host_preset_load_ext;
+    if(strcmp(extension_id, CLAP_EXT_REMOTE_CONTROLS) == 0)
+      return &host_remote_control_ext;
+    if(strcmp(extension_id, "clap.remote-controls.draft/2") == 0)
+      return &host_remote_control_ext;
+    if(strcmp(extension_id, CLAP_EXT_TAIL) == 0)
+      return &host_tail_ext;
+    if(strcmp(extension_id, CLAP_EXT_THREAD_CHECK) == 0)
+      return &host_thread_check_ext;
+    if(strcmp(extension_id, CLAP_EXT_THREAD_POOL) == 0)
+      return &host_thread_pool_ext;
+    if(strcmp(extension_id, CLAP_EXT_VOICE_INFO) == 0)
+      return &host_voice_info_ext;
+    if(strcmp(extension_id, CLAP_EXT_CONTEXT_MENU) == 0)
+      return &host_context_menu_ext;
+    if(strcmp(extension_id, "clap.context-menu.draft/0") == 0)
+      return &host_context_menu_ext;
+    return nullptr;
+  };
+  host.request_restart = [](const clap_host* host) {
+    // Per clap/host.h: deactivate then reactivate the plug-in. This is
+    // [thread-safe] but the actual deactivate/activate must run on the
+    // main thread. We refuse to do the cycle while score is executing —
+    // a live audio thread is using the plug-in in CLAP-active state, and
+    // tearing it down underneath would race with process(). The plug-in
+    // sees the request as deferred (per spec it may be delayed by the
+    // host), and will get the restart on the next stop transition.
+    auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+    if(!m.model)
+      return;
+    QMetaObject::invokeMethod(m.model, [model = QPointer<Model>{m.model}] {
+      if(!model)
+        return;
+      if(model->executing())
+        return;
+      auto h = model->handle();
+      if(!h || !h->plugin)
+        return;
+
+      const auto plug = h->plugin;
+      if(h->activated)
+      {
+        plug->deactivate(plug);
+        h->activated = false;
+      }
+      // Re-activate with the rate/buffer the executor was last using.
+      // We don't have an audio context outside of execution, so fall
+      // back to the standard 44.1k / 1024 frames if nothing else is
+      // known (matches DPF's d_nextSampleRate fallback).
+      const double sr = 44100.0;
+      const uint32_t bs = 1024;
+      if(plug->activate(plug, sr, 1, bs))
+      {
+        h->activated = true;
+      }
+    }, Qt::QueuedConnection);
+  };
+  host.request_process = [](const clap_host* host) {
+    auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+    if(!m.model)
+      return;
+    // unused in score
+  };
+  host.request_callback = [](const clap_host* host) {
+    auto& m = *static_cast<Clap::PluginHandle*>(host->host_data);
+    if(!m.model)
+      return;
+    QMetaObject::invokeMethod(m.model, [handle = std::weak_ptr{m.model->handle()}] {
+      if(auto h = handle.lock())
+      {
+        auto plug = h->plugin;
+        plug->on_main_thread(plug);
+      }
+    }, Qt::QueuedConnection);
+  };
+}
+
+PluginHandle::~PluginHandle()
+{
+  if(plugin)
+  {
+    plugin->destroy(plugin);
+    plugin = nullptr;
+  }
+
+  if(entry)
+  {
+    entry->deinit();
+    entry = nullptr;
+  }
+
+  if(library)
+  {
+#if defined(_WIN32)
+    FreeLibrary((HMODULE)library);
+#else
+    dlclose(library);
+#endif
+    library = nullptr;
+  }
+}
+
+static void loadCLAPState(const clap_plugin_t& plugin, const QByteArray& state)
+{
+  if(state.isEmpty())
+    return;
+
+  // Get state extension
+  auto state_ext
+      = (const clap_plugin_state_t*)plugin.get_extension(&plugin, CLAP_EXT_STATE);
+  if(!state_ext)
+    return;
+
+  // Create input stream
+  struct stream_context
+  {
+    const QByteArray* data;
+    int64_t position;
+  };
+
+  stream_context ctx{&state, 0};
+
+  clap_istream_t stream{};
+  stream.ctx = &ctx;
+  stream.read
+      = [](const clap_istream_t* stream, void* buffer, uint64_t size) -> int64_t {
+    auto* ctx = static_cast<stream_context*>(stream->ctx);
+    int64_t remaining = ctx->data->size() - ctx->position;
+    int64_t to_read = std::min(static_cast<int64_t>(size), remaining);
+
+    if(to_read <= 0)
+      return 0;
+
+    std::memcpy(buffer, ctx->data->constData() + ctx->position, to_read);
+    ctx->position += to_read;
+    return to_read;
+  };
+
+  // Load plugin state
+  state_ext->load(&plugin, &stream);
+}
+
+Model::Model(
+    const TimeVal& duration, const QString& pluginId,
+    const Id<Process::ProcessModel>& id, QObject* parent)
+    : Process::ProcessModel{duration, id, "ClapProcess", parent}
+    , m_plugin{std::make_shared<PluginHandle>()}
+{
+  auto plug = pluginId.split(":::");
+  SCORE_ASSERT(plug.size() == 2);
+  m_pluginPath = plug[0];
+  m_pluginId = plug[1];
+
+  loadPlugin();
+  createControls(false);
+}
+
+Model::Model(DataStream::Deserializer& vis, QObject* parent)
+    : Process::ProcessModel{vis, parent}
+    , m_plugin{std::make_shared<PluginHandle>()}
+{
+  vis.writeTo(*this);
+  loadPlugin();
+  createControls(true);
+}
+
+Model::Model(JSONObject::Deserializer& vis, QObject* parent)
+    : Process::ProcessModel{vis, parent}
+    , m_plugin{std::make_shared<PluginHandle>()}
+{
+  vis.writeTo(*this);
+  loadPlugin();
+  createControls(true);
+}
+
+Model::Model(DataStream::Deserializer&& vis, QObject* parent)
+    : Process::ProcessModel{vis, parent}
+    , m_plugin{std::make_shared<PluginHandle>()}
+{
+  vis.writeTo(*this);
+  loadPlugin();
+  createControls(true);
+}
+
+Model::Model(JSONObject::Deserializer&& vis, QObject* parent)
+    : Process::ProcessModel{vis, parent}
+    , m_plugin{std::make_shared<PluginHandle>()}
+{
+  vis.writeTo(*this);
+  loadPlugin();
+  createControls(true);
+}
+
+Model::~Model()
+{
+  closeUI();
+
+  if(m_plugin->plugin && m_plugin->activated)
+  {
+    m_plugin->plugin->deactivate(m_plugin->plugin);
+    m_plugin->activated = false;
+  }
+
+  // Clean up timers
+  for(auto& [id, timer] : timers)
+  {
+    delete timer;
+  }
+  timers.clear();
+
+  // Clean up fd notifiers (automatically handled by unique_ptr destructors)
+  fd_notifiers.clear();
+}
+
+bool Model::hasExternalUI() const noexcept
+{
+  if(!m_plugin->plugin)
+    return false;
+
+  auto gui = (const clap_plugin_gui_t*)m_plugin->plugin->get_extension(
+      m_plugin->plugin, CLAP_EXT_GUI);
+  return gui != nullptr;
+}
+
+void Model::closeUI() const
+{
+  if(this->externalUI)
+    this->externalUI->close();
+}
+
+void PluginHandle::load(Model& context, QByteArray path, QByteArray id)
+{
+  this->model = &context;
+
+  // Helper to roll back partial-load state. CLAP entry init/deinit is
+  // refcounted (see clap/entry.h): we must NOT call deinit unless init
+  // returned true, otherwise we corrupt the refcount and eventually crash
+  // other plug-ins that share the .clap bundle. Same idea for
+  // dlclose(library) — only meaningful if dlopen succeeded.
+  auto rollback = [this](bool entry_inited) {
+    if(!entry_inited)
+      entry = nullptr;
+    if(!library)
+      return;
+    // If we never reached entry->init() successfully, don't deinit; just
+    // release the library handle so ~PluginHandle doesn't redo it.
+  };
+
+  // Load the library
+#if defined(_WIN32)
+  library = LoadLibraryA(path.data());
+  if(!library)
+    return;
+  entry = (const clap_plugin_entry_t*)GetProcAddress((HMODULE)library, "clap_entry");
+#else
+  library = dlopen(path.data(), RTLD_LAZY);
+  if(!library)
+    return;
+  entry = (const clap_plugin_entry_t*)dlsym(library, "clap_entry");
+#endif
+
+  if(!entry)
+  {
+    // No clap_entry symbol — drop the library handle and bail.
+    rollback(false);
+    return;
+  }
+
+  if(!entry->init(path.data()))
+  {
+    // init() failed: entry pointer is valid but the DSO is uninitialized,
+    // so we must NOT call entry->deinit() later. Forget the entry pointer
+    // so ~PluginHandle's `if(entry) entry->deinit();` is skipped.
+    rollback(false);
+    return;
+  }
+
+  factory = (const clap_plugin_factory_t*)entry->get_factory(CLAP_PLUGIN_FACTORY_ID);
+  if(!factory)
+    return;
+
+  host.host_data = this;
+  plugin = factory->create_plugin(factory, &host, id.data());
+  if(!plugin)
+    return;
+
+  if(!plugin->init(plugin))
+  {
+    plugin->destroy(plugin);
+    plugin = nullptr;
+    return;
+  }
+
+  // Juce calls it during init??
+  ext_timer_support = (const clap_plugin_timer_support_t*)plugin->get_extension(
+      plugin, CLAP_EXT_TIMER_SUPPORT);
+  ext_params
+      = (const clap_plugin_params_t*)plugin->get_extension(plugin, CLAP_EXT_PARAMS);
+
+  desc = plugin->desc;
+}
+
+void Model::loadPlugin()
+{
+  if(m_pluginPath.isEmpty() || m_pluginId.isEmpty())
+    return;
+
+  m_plugin->load(*this, m_pluginPath.toUtf8(), m_pluginId.toUtf8());
+
+  if(m_plugin->plugin && !m_loadedState.isEmpty())
+  {
+    loadCLAPState(*m_plugin->plugin, m_loadedState);
+  }
+
+  m_plugin->activated = false;
+
+  // Connect parameter value feedback from executor to GUI
+  if(auto params = m_plugin->ext_params)
+  {
+    auto& ctx = score::IDocument::documentContext(*this);
+    auto c = connect(&ctx.coarseUpdateTimer, &QTimer::timeout, this, [this] {
+      auto h = handle();
+      if(!h)
+        return;
+      auto plugin = h->plugin;
+      if(!plugin)
+        return;
+      auto params = m_plugin->ext_params;
+      if(!params || !params->get_value)
+        return;
+
+      // Writable params -> ControlInlets.
+      std::size_t inlet_idx = 0;
+      for(auto* inlet : inlets())
+      {
+        if(auto* control = qobject_cast<Process::ControlInlet*>(inlet))
+        {
+          if(inlet_idx < m_plugin->m_parameters_ins.size())
+          {
+            const auto& param_info = m_plugin->m_parameters_ins[inlet_idx];
+            double current_value = 0.0;
+            if(params->get_value(plugin, param_info.id, &current_value))
+            {
+              currentlyReadingValues = true;
+              control->setValue(current_value);
+              currentlyReadingValues = false;
+            }
+          }
+          inlet_idx++;
+        }
+      }
+
+      // Read-only params -> ControlOutlets (Bargraph meters etc.).
+      std::size_t outlet_idx = 0;
+      for(auto* outlet : outlets())
+      {
+        if(auto* control = qobject_cast<Process::ControlOutlet*>(outlet))
+        {
+          if(outlet_idx < m_plugin->m_parameters_outs.size())
+          {
+            const auto& param_info = m_plugin->m_parameters_outs[outlet_idx];
+            double current_value = 0.0;
+            if(params->get_value(plugin, param_info.id, &current_value))
+            {
+              currentlyReadingValues = true;
+              control->setValue(current_value);
+              currentlyReadingValues = false;
+            }
+          }
+          outlet_idx++;
+        }
+      }
+    });
+  }
+
+  // Connect the restart signal
+  connect(this, &Process::ProcessModel::resetExecution, this, [this] {
+    if(m_plugin->plugin && m_plugin->activated)
+    {
+      m_plugin->plugin->deactivate(m_plugin->plugin);
+      m_plugin->activated = false;
+    }
+    // Drain RESCAN_ALL deferred during execution (spec needs deactivate).
+    if(m_pendingRescanFlags != 0)
+    {
+      auto pending = std::exchange(m_pendingRescanFlags, 0u);
+      onParamRescan(pending);
+    }
+  }, Qt::QueuedConnection);
+}
+
+// Gesture debounce window: a slider drag is treated as one gesture if changes
+// keep arriving within this window after the last sample.
+static constexpr int CLAP_GESTURE_DEBOUNCE_MS = 200;
+
+namespace
+{
+// Build a clap_input_events_t backed by a std::vector of event pointers.
+struct ParamInputCtx
+{
+  std::vector<const clap_event_header_t*> events;
+};
+inline clap_input_events_t make_input_events(ParamInputCtx& ctx)
+{
+  return {
+      .ctx = &ctx,
+      .size = +[](const clap_input_events* list) -> uint32_t {
+    return static_cast<const ParamInputCtx*>(list->ctx)->events.size();
+  },
+      .get = +[](const clap_input_events* list,
+                 uint32_t index) -> const clap_event_header_t* {
+    auto* c = static_cast<const ParamInputCtx*>(list->ctx);
+    return index < c->events.size() ? c->events[index] : nullptr;
+  }};
+}
+
+inline clap_event_param_value_t
+make_param_value(const clap_param_info_t& info, double value)
+{
+  clap_event_param_value_t ev{};
+  ev.header.size = sizeof(clap_event_param_value_t);
+  ev.header.time = 0;
+  ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+  ev.header.type = CLAP_EVENT_PARAM_VALUE;
+  ev.header.flags = CLAP_EVENT_IS_LIVE;
+  ev.param_id = info.id;
+  ev.cookie = info.cookie;
+  ev.note_id = -1;
+  ev.port_index = -1;
+  ev.channel = -1;
+  ev.key = -1;
+  ev.value = value;
+  return ev;
+}
+
+inline clap_event_param_gesture_t
+make_param_gesture(clap_id pid, uint16_t type)
+{
+  clap_event_param_gesture_t ev{};
+  ev.header.size = sizeof(clap_event_param_gesture_t);
+  ev.header.time = 0;
+  ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+  ev.header.type = type;
+  ev.header.flags = CLAP_EVENT_IS_LIVE;
+  ev.param_id = pid;
+  return ev;
+}
+} // namespace
+
+void Model::sendParamChange(const clap_param_info_t& info, double value)
+{
+  auto plugin = m_plugin->plugin;
+  if(!plugin)
+    return;
+  auto params
+      = (const clap_plugin_params_t*)plugin->get_extension(plugin, CLAP_EXT_PARAMS);
+  if(!params || !params->flush)
+    return;
+
+  // Manage the gesture state for this parameter.
+  auto& gs = gestures[info.id];
+  if(!gs.endTimer)
+  {
+    gs.endTimer = new QTimer{this};
+    gs.endTimer->setSingleShot(true);
+    gs.endTimer->setInterval(CLAP_GESTURE_DEBOUNCE_MS);
+    QObject::connect(gs.endTimer, &QTimer::timeout, this, [this, pid = info.id] {
+      auto it = gestures.find(pid);
+      if(it == gestures.end())
+        return;
+      endGesture(pid, it->second.cookie);
+    });
+  }
+  gs.cookie = info.cookie;
+
+  const bool was_active = gs.active;
+  if(!gs.active)
+    gs.active = true;
+  gs.endTimer->start();
+
+  // Build event stream: optional GESTURE_BEGIN + PARAM_VALUE.
+  clap_event_param_gesture_t begin_ev{};
+  clap_event_param_value_t value_ev = make_param_value(info, value);
+  ParamInputCtx ctx;
+  ctx.events.reserve(2);
+  if(!was_active)
+  {
+    begin_ev = make_param_gesture(info.id, CLAP_EVENT_PARAM_GESTURE_BEGIN);
+    ctx.events.push_back(&begin_ev.header);
+  }
+  ctx.events.push_back(&value_ev.header);
+
+  clap_input_events_t ip = make_input_events(ctx);
+  clap_output_events_t op{
+      .ctx = this,
+      .try_push = [](const struct clap_output_events*,
+                     const clap_event_header_t*) { return false; }};
+  params->flush(plugin, &ip, &op);
+}
+
+void Model::endGesture(clap_id param_id, void* cookie)
+{
+  auto plugin = m_plugin->plugin;
+  if(!plugin)
+    return;
+  auto params
+      = (const clap_plugin_params_t*)plugin->get_extension(plugin, CLAP_EXT_PARAMS);
+  if(!params || !params->flush)
+    return;
+
+  auto it = gestures.find(param_id);
+  if(it != gestures.end())
+    it->second.active = false;
+
+  clap_event_param_gesture_t end_ev = make_param_gesture(
+      param_id, CLAP_EVENT_PARAM_GESTURE_END);
+  end_ev.header.flags = 0;
+
+  ParamInputCtx ctx;
+  ctx.events.push_back(&end_ev.header);
+  clap_input_events_t ip = make_input_events(ctx);
+  clap_output_events_t op{
+      .ctx = this,
+      .try_push = [](const struct clap_output_events*,
+                     const clap_event_header_t*) { return false; }};
+  params->flush(plugin, &ip, &op);
+}
+
+void Model::setupControlInlet(
+    const clap_plugin_params_t& params, const clap_param_info_t& info, int index,
+    Process::ControlInlet* inlet)
+{
+  inlet->displayHandledExplicitly = true; //(info.flags & CLAP_PARAM_IS_HIDDEN) != 0;
+
+  // Set default value, min, and max for the control inlet
+  double val{};
+  // FIXME if we load we do not want to change the GUI inlet value, instead we
+  // want to reapply it to the state (so that an inlet with a LFO as input does not
+  // change its value randomly on every load
+  if(params.get_value && params.get_value(m_plugin->plugin, info.id, &val))
+  {
+    inlet->setValue(val);
+  }
+  else
+  {
+    inlet->setValue(info.default_value);
+  }
+
+  inlet->setDomain(ossia::make_domain(info.min_value, info.max_value));
+
+  connect(
+      inlet, &Process::ControlInlet::valueChanged, this,
+      [this, i = index](const ossia::value& v) {
+    if(executing())
+      return;
+    if(currentlyReadingValues)
+      return;
+    SCORE_ASSERT(this->parameterInputs().size() > i);
+    auto& param_info = this->parameterInputs()[i];
+    double val
+        = std::clamp(ossia::convert<double>(v), param_info.min_value, param_info.max_value);
+    sendParamChange(param_info, val);
+  });
+}
+
+void Model::setupControlOutlet(
+    const clap_plugin_params_t& params, const clap_param_info_t& info, int index,
+    Process::ControlOutlet* port)
+{
+  port->displayHandledExplicitly = true; //(info.flags & CLAP_PARAM_IS_HIDDEN) != 0;
+
+  // Set default value, min, and max for the control inlet
+  double val{};
+  // FIXME if we load we do not want to change the GUI inlet value, instead we
+  // want to reapply it to the state (so that an inlet with a LFO as input does not
+  // change its value randomly on every load
+  if(params.get_value && params.get_value(m_plugin->plugin, info.id, &val))
+  {
+    port->setValue(val);
+  }
+  else
+  {
+    port->setValue(info.default_value);
+  }
+
+  port->setDomain(ossia::make_domain(info.min_value, info.max_value));
+}
+
+void Model::createControls(bool loading)
+{
+  if(!m_plugin->plugin)
+    return;
+
+  int cur_inlet = 0;
+  int cur_outlet = 0;
+
+  // Get audio ports extension
+  auto audio_ports = (const clap_plugin_audio_ports_t*)m_plugin->plugin->get_extension(
+      m_plugin->plugin, CLAP_EXT_AUDIO_PORTS);
+  m_supports64 = true;
+  m_plugin->m_audio_ins.clear();
+  m_plugin->m_audio_outs.clear();
+  if(audio_ports)
+  {
+    auto input_count = audio_ports->count(m_plugin->plugin, true);
+    for(uint32_t i = 0; i < input_count; ++i)
+    {
+      clap_audio_port_info_t info{};
+      if(audio_ports->get(m_plugin->plugin, i, true, &info))
+      {
+        m_supports64 &= (info.flags & CLAP_AUDIO_PORT_SUPPORTS_64BITS);
+
+        if(!loading)
+        {
+          QString name = clap_safe_name(
+              info.name, input_count == 1 ? QStringLiteral("Audio In")
+                                          : QStringLiteral("Audio In %1").arg(i + 1));
+          if(i == 0 && name.toLower() == "audio input")
+            name = "Audio In";
+          auto inlet = new Process::AudioInlet(
+              name, Id<Process::Port>(getStrongId(m_inlets)), this);
+          m_inlets.push_back(inlet);
+        }
+
+        m_plugin->m_audio_ins.push_back(info);
+        cur_inlet++;
+      }
+    }
+    auto output_count = audio_ports->count(m_plugin->plugin, false);
+    for(uint32_t i = 0; i < output_count; ++i)
+    {
+      clap_audio_port_info_t info{};
+      if(audio_ports->get(m_plugin->plugin, i, false, &info))
+      {
+        m_supports64 &= (info.flags & CLAP_AUDIO_PORT_SUPPORTS_64BITS);
+
+        if(!loading)
+        {
+          QString name = clap_safe_name(
+              info.name, output_count == 1 ? QStringLiteral("Audio Out")
+                                           : QStringLiteral("Audio Out %1").arg(i + 1));
+          if(i == 0 && name.toLower() == "audio output")
+            name = "Audio Out";
+          auto outlet = new Process::AudioOutlet(
+              name, Id<Process::Port>(getStrongId(m_outlets)), this);
+          if(info.flags & CLAP_AUDIO_PORT_IS_MAIN)
+          {
+            outlet->setPropagate(true);
+          }
+          m_outlets.push_back(outlet);
+        }
+
+        m_plugin->m_audio_outs.push_back(info);
+        cur_outlet++;
+      }
+    }
+  }
+
+  // Get note ports extension
+  m_plugin->m_midi_ins.clear();
+  m_plugin->m_midi_outs.clear();
+  auto note_ports = (const clap_plugin_note_ports_t*)m_plugin->plugin->get_extension(
+      m_plugin->plugin, CLAP_EXT_NOTE_PORTS);
+  if(note_ports)
+  {
+    uint32_t input_count = note_ports->count(m_plugin->plugin, true);
+    for(uint32_t i = 0; i < input_count; ++i)
+    {
+      clap_note_port_info_t info{};
+      if(note_ports->get(m_plugin->plugin, i, true, &info))
+      {
+        if(!loading)
+        {
+          QString name = clap_safe_name(
+              info.name, input_count == 1 ? QStringLiteral("MIDI In")
+                                          : QStringLiteral("MIDI In %1").arg(i + 1));
+          if(i == 0 && name.toLower() == "midi input")
+            name = "MIDI In";
+          auto inlet = new Process::MidiInlet(
+              name, Id<Process::Port>(getStrongId(m_inlets)), this);
+          m_inlets.push_back(inlet);
+        }
+
+        m_plugin->m_midi_ins.push_back(info);
+        cur_inlet++;
+      }
+    }
+    uint32_t output_count = note_ports->count(m_plugin->plugin, false);
+    for(uint32_t i = 0; i < output_count; ++i)
+    {
+      clap_note_port_info_t info{};
+      if(note_ports->get(m_plugin->plugin, i, false, &info))
+      {
+        if(!loading)
+        {
+          QString name = clap_safe_name(
+              info.name, output_count == 1 ? QStringLiteral("MIDI Out")
+                                           : QStringLiteral("MIDI Out %1").arg(i + 1));
+          if(i == 0 && name.toLower() == "midi output")
+            name = "MIDI Out";
+          auto outlet = new Process::MidiOutlet(
+              name, Id<Process::Port>(getStrongId(m_outlets)), this);
+          m_outlets.push_back(outlet);
+        }
+
+        m_plugin->m_midi_outs.push_back(info);
+        cur_outlet++;
+      }
+    }
+  }
+
+  // Get params extension
+  auto params = (const clap_plugin_params_t*)m_plugin->plugin->get_extension(
+      m_plugin->plugin, CLAP_EXT_PARAMS);
+  if(params)
+  {
+    uint32_t param_count = params->count(m_plugin->plugin);
+    for(uint32_t i = 0; i < param_count; ++i)
+    {
+      clap_param_info_t info{};
+      if(params->get_info(m_plugin->plugin, i, &info))
+      {
+        if(info.flags & CLAP_PARAM_IS_HIDDEN)
+          continue;
+        if(!(info.flags & CLAP_PARAM_IS_READONLY))
+        {
+          if(!loading)
+          {
+            const QString param_name = clap_safe_name(
+                info.name, QStringLiteral("Param %1").arg(i + 1));
+            Process::ControlInlet* inlet{};
+            if(info.flags & CLAP_PARAM_IS_STEPPED)
+              inlet = new Process::IntSlider(
+                  param_name, Id<Process::Port>(getStrongId(m_inlets)), this);
+            else
+              inlet = new Process::FloatSlider(
+                  param_name, Id<Process::Port>(getStrongId(m_inlets)), this);
+
+            setupControlInlet(*params, info, i, inlet);
+
+            m_inlets.push_back(inlet);
+          }
+          else
+          {
+            setupControlInlet(
+                *params, info, i,
+                qobject_cast<Process::ControlInlet*>(m_inlets[cur_inlet]));
+          }
+
+          // Store parameter info for executor
+          m_plugin->m_parameters_ins.push_back(info);
+          cur_inlet++;
+        }
+        else
+        {
+          if(!loading)
+          {
+            const QString param_name = clap_safe_name(
+                info.name, QStringLiteral("Out %1").arg(i + 1));
+            Process::ControlOutlet* port{};
+            port = new Process::Bargraph(
+                param_name, Id<Process::Port>(getStrongId(m_outlets)), this);
+
+            setupControlOutlet(*params, info, i, port);
+
+            m_outlets.push_back(port);
+          }
+          else
+          {
+            setupControlOutlet(
+                *params, info, i,
+                qobject_cast<Process::ControlOutlet*>(m_outlets[cur_outlet]));
+          }
+
+          // Store parameter info for executor
+          m_plugin->m_parameters_outs.push_back(info);
+          cur_outlet++;
+        }
+      }
+    }
+  }
+
+  m_plugin->param_outs_by_id.clear();
+  m_plugin->param_outs_by_id.reserve(m_plugin->m_parameters_outs.size());
+  for(std::size_t i = 0; i < m_plugin->m_parameters_outs.size(); ++i)
+    m_plugin->param_outs_by_id.emplace(
+        m_plugin->m_parameters_outs[i].id, static_cast<std::uint32_t>(i));
+
+  inletsChanged();
+  outletsChanged();
+}
+
+Process::ProcessFlags Model::flags() const noexcept
+{
+  auto flags = Metadata<Process::ProcessFlags_k, Model>::get();
+  return flags;
+}
+
+void Model::loadPreset(const Process::Preset& preset)
+{
+  if(!m_plugin || !m_plugin->plugin)
+    return;
+
+  const rapidjson::Document doc = readJson(preset.data);
+  if(!doc.IsObject())
+    return;
+  auto obj = doc.GetObject();
+
+  // Try to load using CLAP state (preferred method)
+  if(auto it = obj.FindMember("State"); it != obj.MemberEnd())
+  {
+    QByteArray data = QByteArray::fromBase64(JsonValue{it->value}.toByteArray());
+    if(!data.isEmpty())
+    {
+      // Get state extension and load the state
+      auto state = (const clap_plugin_state_t*)m_plugin->plugin->get_extension(
+          m_plugin->plugin, CLAP_EXT_STATE);
+      if(state)
+      {
+        struct stream_context
+        {
+          const char* data;
+          size_t size;
+          size_t pos;
+        };
+
+        stream_context ctx{data.constData(), static_cast<size_t>(data.size()), 0};
+
+        clap_istream_t stream{};
+        stream.ctx = &ctx;
+        stream.read
+            = [](const clap_istream_t* stream, void* buffer, uint64_t size) -> int64_t {
+          auto* ctx = static_cast<stream_context*>(stream->ctx);
+          if(ctx->pos >= ctx->size)
+            return 0;
+
+          uint64_t to_read = std::min(int64_t(size), int64_t(ctx->size - ctx->pos));
+          std::memcpy(buffer, ctx->data + ctx->pos, to_read);
+          ctx->pos += to_read;
+          return static_cast<int64_t>(to_read);
+        };
+
+        // Load the state
+        if(state->load(m_plugin->plugin, &stream))
+        {
+          // Update parameters after loading state
+          auto params = (const clap_plugin_params_t*)m_plugin->plugin->get_extension(
+              m_plugin->plugin, CLAP_EXT_PARAMS);
+          if(params)
+          {
+            for(auto& inlet : m_inlets)
+            {
+              if(auto ctl = qobject_cast<Process::ControlInlet*>(inlet))
+              {
+                // Find parameter by ID and update inlet value
+                for(const auto& param_info : m_plugin->m_parameters_ins)
+                {
+                  if(param_info.id == ctl->id().val())
+                  {
+                    double value;
+                    if(params->get_value(m_plugin->plugin, param_info.id, &value))
+                    {
+                      ctl->setValue(value);
+                    }
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  // Try preset load extension (for file-based and builtin presets)
+  else if(auto loc_it = obj.FindMember("PresetLocation"); loc_it != obj.MemberEnd())
+  {
+    auto preset_load = (const clap_plugin_preset_load_t*)m_plugin->plugin->get_extension(
+        m_plugin->plugin, CLAP_EXT_PRESET_LOAD);
+    if(!preset_load)
+      preset_load = (const clap_plugin_preset_load_t*)m_plugin->plugin->get_extension(
+          m_plugin->plugin, "clap.preset-load.draft/2");
+    if(preset_load)
+    {
+      QString location = JsonValue{loc_it->value}.toString();
+      QString load_key;
+      uint32_t location_kind = CLAP_PRESET_DISCOVERY_LOCATION_FILE; // Default to file
+
+      // Check for location kind (for builtin presets)
+      if(auto kind_it = obj.FindMember("LocationKind"); kind_it != obj.MemberEnd())
+      {
+        location_kind = static_cast<uint32_t>(JsonValue{kind_it->value}.toInt());
+      }
+
+      if(auto key_it = obj.FindMember("LoadKey"); key_it != obj.MemberEnd())
+      {
+        load_key = JsonValue{key_it->value}.toString();
+      }
+
+      // For builtin presets, location should be null/empty
+      const char* location_str = "";
+      if(location_kind == CLAP_PRESET_DISCOVERY_LOCATION_FILE && !location.isEmpty())
+      {
+        location_str = location.toUtf8().constData();
+      }
+
+      preset_load->from_location(
+          m_plugin->plugin, location_kind, location_str,
+          load_key.isEmpty() ? "" : load_key.toUtf8().constData());
+    }
+  }
+}
+
+Process::Preset Model::savePreset() const noexcept
+{
+  Process::Preset p;
+  p.name = this->metadata().getName();
+  p.key.key = this->concreteKey();
+  p.key.effect = this->effect();
+
+  if(!m_plugin || !m_plugin->plugin)
+  {
+    p.data = "{}";
+    return p;
+  }
+
+  // Save using CLAP state extension
+  QByteArray data = readCLAPState(*m_plugin->plugin);
+
+  JSONReader r;
+  r.stream.StartObject();
+  r.obj["State"] = data.toBase64();
+  r.stream.EndObject();
+  p.data = r.toByteArray();
+  return p;
+}
+
+std::vector<Process::Preset> Model::builtinPresets() const noexcept
+{
+  std::vector<Process::Preset> presets;
+
+  if(!m_plugin || !m_plugin->plugin || !m_plugin->entry)
+    return presets;
+
+  // Get the preset discovery factory from the plugin entry
+  auto preset_discovery_factory = static_cast<const clap_preset_discovery_factory_t*>(
+      m_plugin->entry->get_factory(CLAP_PRESET_DISCOVERY_FACTORY_ID));
+  
+  if(!preset_discovery_factory)
+  {
+    // Try the compatibility ID as fallback
+    preset_discovery_factory = static_cast<const clap_preset_discovery_factory_t*>(
+        m_plugin->entry->get_factory("clap.preset-discovery-factory/draft-2"));
+  }
+
+  if(!preset_discovery_factory)
+    return presets;
+
+  // Create a temporary indexer to receive preset metadata
+  struct preset_metadata_collector
+  {
+    std::vector<Process::Preset>* target_presets;
+    QString plugin_name;
+    UuidKey<Process::ProcessModel> process_key;
+    QString effect_name;
+    std::vector<const clap_preset_discovery_location_t*> locations;
+  };
+
+  preset_metadata_collector collector{&presets, this->prettyName(), this->concreteKey(), this->effect()};
+
+  clap_preset_discovery_indexer_t indexer{};
+  indexer.clap_version = CLAP_VERSION;
+  indexer.name = "ossia score";
+  indexer.vendor = "ossia.io";
+  indexer.url = "https://ossia.io";
+  indexer.version = SCORE_TAG_NO_V;
+  indexer.indexer_data = &collector;
+
+  // Implement required indexer callbacks
+  indexer.declare_filetype = [](const clap_preset_discovery_indexer_t* indexer,
+                                const clap_preset_discovery_filetype_t* filetype) -> bool {
+    return true; // Accept all filetypes for builtin presets
+  };
+
+  indexer.declare_location
+      = [](const clap_preset_discovery_indexer_t* indexer,
+           const clap_preset_discovery_location_t* location) -> bool {
+    auto& self = *(preset_metadata_collector*)indexer->indexer_data;
+    self.locations.push_back(location);
+    return true; // Accept all locations for builtin presets
+  };
+
+  indexer.declare_soundpack = [](const clap_preset_discovery_indexer_t* indexer,
+                                 const clap_preset_discovery_soundpack_t* soundpack) -> bool {
+    return true; // Accept all soundpacks
+  };
+
+  indexer.get_extension = [](const clap_preset_discovery_indexer_t* indexer,
+                             const char* extension_id) -> const void* {
+    return nullptr; // No extensions needed for basic preset discovery
+  };
+
+  // Create metadata receiver to collect preset information
+  clap_preset_discovery_metadata_receiver_t metadata_receiver{};
+  metadata_receiver.receiver_data = &collector;
+
+  metadata_receiver.on_error = [](const clap_preset_discovery_metadata_receiver_t* receiver,
+                                  int32_t os_error,
+                                  const char* error_message) {
+    qWarning() << "CLAP preset discovery error:" << (error_message ? error_message : "Unknown error");
+  };
+
+  metadata_receiver.begin_preset = [](const clap_preset_discovery_metadata_receiver_t* receiver,
+                                      const char* name,
+                                      const char* load_key) -> bool {
+    auto* collector = static_cast<preset_metadata_collector*>(receiver->receiver_data);
+    
+    Process::Preset preset;
+    preset.name = QString::fromUtf8(name ? name : "Unnamed Preset");
+    preset.key.key = collector->process_key;
+    preset.key.effect = collector->effect_name;
+
+    // Store preset location information for loading later
+    JSONReader r;
+    r.stream.StartObject();
+    r.obj["LocationKind"] = static_cast<int>(CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN);
+    r.obj["PresetLocation"] = QString{}; // Empty for builtin presets
+    if(load_key)
+      r.obj["LoadKey"] = QString::fromUtf8(load_key);
+    r.stream.EndObject();
+    preset.data = r.toByteArray();
+
+    collector->target_presets->push_back(std::move(preset));
+    return true;
+  };
+
+  metadata_receiver.add_plugin_id
+      = [](const clap_preset_discovery_metadata_receiver_t* receiver,
+           const clap_universal_plugin_id_t* plugin_id) { SCORE_TODO; };
+
+  metadata_receiver.set_soundpack_id
+      = [](const clap_preset_discovery_metadata_receiver_t* receiver,
+           const char* soundpack_id) { SCORE_TODO; };
+
+  metadata_receiver.set_flags
+      = [](const clap_preset_discovery_metadata_receiver_t* receiver, uint32_t flags) {
+    SCORE_TODO;
+  };
+
+  metadata_receiver.add_creator
+      = [](const clap_preset_discovery_metadata_receiver_t* receiver,
+           const char* creator) { SCORE_TODO; };
+
+  metadata_receiver.set_description
+      = [](const clap_preset_discovery_metadata_receiver_t* receiver,
+           const char* description) { SCORE_TODO; };
+
+  metadata_receiver.set_timestamps =
+      [](const clap_preset_discovery_metadata_receiver_t* receiver,
+         clap_timestamp creation_time, clap_timestamp modification_time) { SCORE_TODO; };
+
+  metadata_receiver.add_feature
+      = [](const clap_preset_discovery_metadata_receiver_t* receiver,
+           const char* feature) { SCORE_TODO; };
+
+  metadata_receiver.add_extra_info
+      = [](const clap_preset_discovery_metadata_receiver_t* receiver, const char* key,
+           const char* value) { SCORE_TODO; };
+
+  // Enumerate all preset providers
+  uint32_t provider_count = preset_discovery_factory->count(preset_discovery_factory);
+  for(uint32_t i = 0; i < provider_count; ++i)
+  {
+    auto provider_desc = preset_discovery_factory->get_descriptor(preset_discovery_factory, i);
+    if(!provider_desc)
+      continue;
+
+    auto provider = preset_discovery_factory->create(preset_discovery_factory, &indexer, provider_desc->id);
+    if(!provider)
+      continue;
+
+    // Initialize the provider
+    if(provider->init && provider->init(provider))
+    {
+      for(auto loc : collector.locations)
+      {
+        if(provider->get_metadata)
+        {
+          if(loc->location && strlen(loc->location))
+          {
+            provider->get_metadata(
+                provider, CLAP_PRESET_DISCOVERY_LOCATION_FILE, loc->location,
+                &metadata_receiver);
+          }
+          else
+          {
+            provider->get_metadata(
+                provider, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN, nullptr,
+                &metadata_receiver);
+          }
+        }
+      }
+    }
+
+    // Clean up the provider
+    if(provider->destroy)
+      provider->destroy(provider);
+  }
+
+  return presets;
+}
+
+namespace
+{
+// Find and update the i-th ControlInlet / ControlOutlet on a Model under
+// the currentlyReadingValues guard, so the GUI handler does not echo the
+// value back into a fresh params->flush() call.
+template <typename Port>
+void apply_value_at(Model& self, std::size_t idx, double v)
+{
+  std::size_t found = 0;
+  if constexpr(std::is_same_v<Port, Process::ControlInlet>)
+  {
+    for(auto* inlet : self.inlets())
+    {
+      if(auto* ctl = qobject_cast<Process::ControlInlet*>(inlet))
+      {
+        if(found == idx)
+        {
+          self.currentlyReadingValues = true;
+          ctl->setValue(v);
+          self.currentlyReadingValues = false;
+          return;
+        }
+        ++found;
+      }
+    }
+  }
+  else
+  {
+    for(auto* outlet : self.outlets())
+    {
+      if(auto* ctl = qobject_cast<Process::ControlOutlet*>(outlet))
+      {
+        if(found == idx)
+        {
+          self.currentlyReadingValues = true;
+          ctl->setValue(v);
+          self.currentlyReadingValues = false;
+          return;
+        }
+        ++found;
+      }
+    }
+  }
+}
+} // namespace
+
+void Model::refreshParamValues()
+{
+  if(!m_plugin || !m_plugin->plugin)
+    return;
+  auto* plugin = m_plugin->plugin;
+  auto params = m_plugin->ext_params;
+  if(!params || !params->get_value)
+    return;
+
+  std::size_t inlet_idx = 0;
+  for(auto* inlet : inlets())
+  {
+    if(auto* control = qobject_cast<Process::ControlInlet*>(inlet))
+    {
+      if(inlet_idx < m_plugin->m_parameters_ins.size())
+      {
+        const auto& info = m_plugin->m_parameters_ins[inlet_idx];
+        double v = 0.0;
+        if(params->get_value(plugin, info.id, &v))
+        {
+          currentlyReadingValues = true;
+          control->setValue(v);
+          currentlyReadingValues = false;
+        }
+      }
+      ++inlet_idx;
+    }
+  }
+
+  std::size_t outlet_idx = 0;
+  for(auto* outlet : outlets())
+  {
+    if(auto* control = qobject_cast<Process::ControlOutlet*>(outlet))
+    {
+      if(outlet_idx < m_plugin->m_parameters_outs.size())
+      {
+        const auto& info = m_plugin->m_parameters_outs[outlet_idx];
+        double v = 0.0;
+        if(params->get_value(plugin, info.id, &v))
+        {
+          currentlyReadingValues = true;
+          control->setValue(v);
+          currentlyReadingValues = false;
+        }
+      }
+      ++outlet_idx;
+    }
+  }
+}
+
+bool Model::refreshParamInfoIfStable()
+{
+  if(!m_plugin || !m_plugin->plugin)
+    return true;
+  auto* plugin = m_plugin->plugin;
+  auto params = m_plugin->ext_params;
+  if(!params || !params->count || !params->get_info)
+    return true;
+
+  const uint32_t new_count = params->count(plugin);
+  const std::size_t old_count
+      = m_plugin->m_parameters_ins.size() + m_plugin->m_parameters_outs.size();
+  if(new_count != old_count)
+    return false;
+
+  std::size_t in_idx = 0, out_idx = 0;
+  for(uint32_t i = 0; i < new_count; ++i)
+  {
+    clap_param_info_t info{};
+    if(!params->get_info(plugin, i, &info))
+      return false;
+    if(info.flags & CLAP_PARAM_IS_HIDDEN)
+      continue;
+    if(!(info.flags & CLAP_PARAM_IS_READONLY))
+    {
+      if(in_idx >= m_plugin->m_parameters_ins.size())
+        return false;
+      if(m_plugin->m_parameters_ins[in_idx].id != info.id)
+        return false;
+      m_plugin->m_parameters_ins[in_idx] = info;
+      ++in_idx;
+    }
+    else
+    {
+      if(out_idx >= m_plugin->m_parameters_outs.size())
+        return false;
+      if(m_plugin->m_parameters_outs[out_idx].id != info.id)
+        return false;
+      m_plugin->m_parameters_outs[out_idx] = info;
+      ++out_idx;
+    }
+  }
+  if(in_idx != m_plugin->m_parameters_ins.size()
+     || out_idx != m_plugin->m_parameters_outs.size())
+    return false;
+
+  // Don't re-invoke setupControlInlet: it would duplicate valueChanged connections.
+  std::size_t inlet_idx = 0, outlet_idx = 0;
+  for(auto* inlet : inlets())
+  {
+    if(auto* ctl = qobject_cast<Process::ControlInlet*>(inlet))
+    {
+      if(inlet_idx < m_plugin->m_parameters_ins.size())
+      {
+        const auto& info = m_plugin->m_parameters_ins[inlet_idx];
+        ctl->setName(clap_safe_name(
+            info.name, QStringLiteral("Param %1").arg(inlet_idx + 1)));
+        ctl->setDomain(ossia::make_domain(info.min_value, info.max_value));
+      }
+      ++inlet_idx;
+    }
+  }
+  for(auto* outlet : outlets())
+  {
+    if(auto* ctl = qobject_cast<Process::ControlOutlet*>(outlet))
+    {
+      if(outlet_idx < m_plugin->m_parameters_outs.size())
+      {
+        const auto& info = m_plugin->m_parameters_outs[outlet_idx];
+        ctl->setName(clap_safe_name(
+            info.name, QStringLiteral("Out %1").arg(outlet_idx + 1)));
+        ctl->setDomain(ossia::make_domain(info.min_value, info.max_value));
+      }
+      ++outlet_idx;
+    }
+  }
+  return true;
+}
+
+void Model::onParamRescan(clap_param_rescan_flags flags)
+{
+  if(!m_plugin || !m_plugin->plugin)
+    return;
+
+  // RESCAN_ALL needs deactivation; defer if executing.
+  if((flags & CLAP_PARAM_RESCAN_ALL) && executing())
+  {
+    m_pendingRescanFlags |= flags;
+    return;
+  }
+
+  // RESCAN_TEXT: nothing cached, display strings fetched on demand.
+  (void)CLAP_PARAM_RESCAN_TEXT;
+
+  if(flags & CLAP_PARAM_RESCAN_INFO)
+  {
+    if(!refreshParamInfoIfStable())
+      flags |= CLAP_PARAM_RESCAN_ALL;
+  }
+
+  if(flags & CLAP_PARAM_RESCAN_ALL)
+  {
+    if(refreshParamInfoIfStable())
+    {
+      refreshParamValues();
+      return;
+    }
+    // FIXME score does not rebuild inlets dynamically (see VST2/VST3 backends).
+    qWarning() << "CLAP: parameter layout changed at runtime for"
+               << m_pluginId
+               << "— score doesn't yet rebuild inlets dynamically. "
+                  "Remove and re-add the plug-in to pick up the new "
+                  "parameter set.";
+    restartPlugin();
+    return;
+  }
+
+  if(flags & CLAP_PARAM_RESCAN_VALUES)
+    refreshParamValues();
+}
+
+void Model::markStateDirty()
+{
+  // Plug-ins (Vital, Surge XT) fire this on every UI tweak; debounce.
+  constexpr int kStateDirtyDebounceMs = 400;
+
+  if(!m_stateDirtyTimer)
+  {
+    m_stateDirtyTimer = new QTimer(this);
+    m_stateDirtyTimer->setSingleShot(true);
+    m_stateDirtyTimer->setInterval(kStateDirtyDebounceMs);
+    connect(m_stateDirtyTimer, &QTimer::timeout, this, [this] {
+      if(!m_plugin || !m_plugin->plugin)
+        return;
+      QByteArray blob = Clap::readCLAPState(*m_plugin->plugin);
+      if(!blob.isEmpty())
+        stateSnapshotChanged(blob);
+    });
+  }
+  m_stateDirtyTimer->start();
+}
+
+void Model::flushFromPluginToHost()
+{
+  auto plugin = m_plugin->plugin;
+  if(!plugin)
+    return;
+  auto params
+      = (const clap_plugin_params_t*)plugin->get_extension(plugin, CLAP_EXT_PARAMS);
+  if(!params || !params->flush)
+    return;
+  if(this->executing())
+    return;
+
+  ParamInputCtx in_ctx; // empty
+  clap_input_events_t ip = make_input_events(in_ctx);
+
+  clap_output_events_t op{
+      .ctx = this,
+      .try_push = [](const struct clap_output_events* list,
+                     const clap_event_header_t* event) -> bool {
+    auto* self = static_cast<Model*>(list->ctx);
+    if(!event || event->space_id != CLAP_CORE_EVENT_SPACE_ID)
+      return true;
+    if(event->type != CLAP_EVENT_PARAM_VALUE)
+      return true;
+    if(event->size < sizeof(clap_event_param_value_t))
+      return true;
+
+    auto* pv = reinterpret_cast<const clap_event_param_value_t*>(event);
+
+    std::size_t idx = 0;
+    for(auto& info : self->m_plugin->m_parameters_ins)
+    {
+      if(info.id == pv->param_id)
+      {
+        apply_value_at<Process::ControlInlet>(*self, idx, pv->value);
+        return true;
+      }
+      ++idx;
+    }
+    idx = 0;
+    for(auto& info : self->m_plugin->m_parameters_outs)
+    {
+      if(info.id == pv->param_id)
+      {
+        apply_value_at<Process::ControlOutlet>(*self, idx, pv->value);
+        return true;
+      }
+      ++idx;
+    }
+    return true;
+  }};
+
+  params->flush(plugin, &ip, &op);
+
+  // Plugins that update internal state silently (without pushing events
+  // through `out`) still expose fresh values via get_value(); poll them so
+  // the GUI mirrors the plugin state, for both writable and read-only params.
+  std::size_t inlet_idx = 0;
+  for(auto* inlet : inlets())
+  {
+    if(auto* control = qobject_cast<Process::ControlInlet*>(inlet))
+    {
+      if(inlet_idx < m_plugin->m_parameters_ins.size())
+      {
+        const auto& param_info = m_plugin->m_parameters_ins[inlet_idx];
+        double current_value = 0.0;
+        if(params->get_value(plugin, param_info.id, &current_value))
+        {
+          currentlyReadingValues = true;
+          control->setValue(current_value);
+          currentlyReadingValues = false;
+        }
+      }
+      inlet_idx++;
+    }
+  }
+  std::size_t outlet_idx = 0;
+  for(auto* outlet : outlets())
+  {
+    if(auto* control = qobject_cast<Process::ControlOutlet*>(outlet))
+    {
+      if(outlet_idx < m_plugin->m_parameters_outs.size())
+      {
+        const auto& param_info = m_plugin->m_parameters_outs[outlet_idx];
+        double current_value = 0.0;
+        if(params->get_value(plugin, param_info.id, &current_value))
+        {
+          currentlyReadingValues = true;
+          control->setValue(current_value);
+          currentlyReadingValues = false;
+        }
+      }
+      outlet_idx++;
+    }
+  }
+}
+}
+
+template <>
+QString
+Process::EffectProcessFactory_T<Clap::Model>::customConstructionData() const noexcept
+{
+  return "";
+}
+template <>
+Process::Descriptor
+Process::EffectProcessFactory_T<Clap::Model>::descriptor(QString txt) const noexcept
+{
+  Process::Descriptor d;
+
+  auto t = txt.split(":::");
+  if(t.size() != 2)
+    return d;
+  auto pluginPath = t[0];
+  auto pluginId = t[1];
+
+  auto& plug = score::GUIAppContext().guiApplicationPlugin<Clap::ApplicationPlugin>();
+  for(const auto& plugin : plug.plugins())
+  {
+    if(plugin.path == pluginPath && plugin.id == pluginId)
+    {
+      d.author = plugin.vendor;
+      d.prettyName = plugin.name;
+      d.description = plugin.description;
+      d.documentationLink = plugin.manual_url;
+      if(d.documentationLink.isEmpty())
+        d.documentationLink = plugin.url;
+      if(d.documentationLink.isEmpty())
+        d.documentationLink = plugin.support_url;
+      d.tags = plugin.features;
+      break;
+    }
+  }
+  return d;
+}
+template <>
+Process::Descriptor Process::EffectProcessFactory_T<Clap::Model>::descriptor(
+    const Process::ProcessModel& d) const noexcept
+{
+  Process::Descriptor desc;
+  return descriptor(d.effect());
+}
+
+template <>
+void DataStreamReader::read(const Clap::Model& proc)
+{
+  QByteArray state;
+  if(proc.m_plugin && proc.m_plugin->plugin)
+  {
+    state = Clap::readCLAPState(*proc.m_plugin->plugin);
+  }
+
+  m_stream << proc.m_pluginPath << proc.m_pluginId << state;
+
+  readPorts(*this, proc.m_inlets, proc.m_outlets);
+  insertDelimiter();
+}
+
+template <>
+void DataStreamWriter::write(Clap::Model& proc)
+{
+  m_stream >> proc.m_pluginPath >> proc.m_pluginId >> proc.m_loadedState;
+
+  writePorts(
+      *this, components.interfaces<Process::PortFactoryList>(), proc.m_inlets,
+      proc.m_outlets, &proc);
+
+  checkDelimiter();
+}
+
+template <>
+void JSONReader::read(const Clap::Model& proc)
+{
+  obj["PluginPath"] = proc.m_pluginPath;
+  obj["PluginId"] = proc.m_pluginId;
+
+  // FIXME CLAP_STATE_CONTEXT_FOR_PROJECT
+  // Save plugin state
+  QByteArray state;
+  if(proc.m_plugin && proc.m_plugin->plugin)
+  {
+    state = Clap::readCLAPState(*proc.m_plugin->plugin);
+  }
+  obj["State"] = state.toBase64();
+
+  readPorts(*this, proc.m_inlets, proc.m_outlets);
+}
+
+template <>
+void JSONWriter::write(Clap::Model& proc)
+{
+  proc.m_pluginPath = obj["PluginPath"].toString();
+  proc.m_pluginId = obj["PluginId"].toString();
+  proc.m_loadedState = QByteArray::fromBase64(obj["State"].toByteArray());
+
+  writePorts(
+      *this, components.interfaces<Process::PortFactoryList>(), proc.m_inlets,
+      proc.m_outlets, &proc);
+}

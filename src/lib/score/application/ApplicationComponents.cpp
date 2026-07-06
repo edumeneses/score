@@ -1,0 +1,85 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check
+// it. PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
+#include "ApplicationComponents.hpp"
+
+#include <score/command/CommandGeneratorMap.hpp>
+#include <score/plugins/PluginInstances.hpp>
+#include <score/plugins/application/GUIApplicationPlugin.hpp>
+#include <score/plugins/documentdelegate/DocumentDelegateFactory.hpp>
+#include <score/plugins/panel/PanelDelegate.hpp>
+#include <score/tools/exceptions/MissingCommand.hpp>
+#include <score/tools/std/String.hpp>
+
+#include <ossia/detail/algorithms.hpp>
+
+namespace score
+{
+ApplicationComponentsData::ApplicationComponentsData() = default;
+ApplicationComponentsData::~ApplicationComponentsData()
+{
+  commands.clear();
+  /*
+   for(auto& elt : settings)
+   {
+       delete elt;
+   }*/
+
+  for(auto& elt : guiAppPlugins)
+  {
+    delete elt;
+  }
+  guiAppPlugins.clear();
+
+  for(auto& elt : appPlugins)
+  {
+    delete elt;
+  }
+  appPlugins.clear();
+
+  const auto& static_plugs = score::staticPlugins();
+  for(auto& elt : addons)
+  {
+    if(elt.plugin && ossia::find(static_plugs, elt.plugin) == static_plugs.end())
+    {
+      if(auto obj = dynamic_cast<QObject*>(elt.plugin))
+      {
+        obj->deleteLater();
+      }
+      else
+      {
+        delete obj;
+      }
+    }
+  }
+  addons.clear();
+}
+
+InterfaceListBase* ApplicationComponentsData::findInterfaceList(
+    const UuidKey<score::InterfaceBase>& k) const noexcept
+{
+  auto it = factories.find(k);
+  if(it != factories.end())
+  {
+    return it->second.get();
+  }
+  return nullptr;
+}
+
+Command* ApplicationComponents::instantiateUndoCommand(const CommandData& cmd) const
+{
+  auto it = m_data.commands.find({cmd.parentKey, cmd.commandKey});
+  if(it != m_data.commands.end())
+  {
+    return (*it->second)(cmd.data);
+  }
+
+#if defined(SCORE_DEBUG)
+  qDebug() << "ALERT: Command" << cmd.parentKey.toString()
+           << "::" << cmd.commandKey.toString() << "could not be instantiated.";
+  SCORE_ABORT;
+#else
+  throw MissingCommandException(cmd.parentKey, cmd.commandKey);
+#endif
+  return nullptr;
+}
+}

@@ -1,0 +1,65 @@
+#include <score/application/ApplicationContext.hpp>
+#include <score/graphics/widgets/QGraphicsPixmapToggle.hpp>
+#include <score/model/Skin.hpp>
+
+#include <core/application/ApplicationSettings.hpp>
+
+#include <QGraphicsSceneMouseEvent>
+#include <QGuiApplication>
+
+#include <cmath>
+#include <wobjectimpl.h>
+W_OBJECT_IMPL(score::QGraphicsPixmapToggle);
+
+namespace score
+{
+QGraphicsPixmapToggle::QGraphicsPixmapToggle(
+    QPixmap pressed, QPixmap released, QGraphicsItem* parent)
+    : QGraphicsPixmapItem{released, parent}
+    , m_pressed{std::move(pressed)}
+    , m_released{std::move(released)}
+{
+  // TODO https://bugreports.qt.io/browse/QTBUG-77970
+  setShapeMode(QGraphicsPixmapItem::BoundingRectShape);
+  auto& skin = score::Skin::instance();
+  setCursor(skin.CursorPointingHand);
+  this->setAcceptedMouseButtons(Qt::LeftButton | Qt::RightButton);
+
+  static const bool vector_gui = score::AppContext().applicationSettings.vector_gui;
+  if(vector_gui || std::fmod(qGuiApp->devicePixelRatio(), 1.0f) != 0.f)
+    this->setTransformationMode(Qt::SmoothTransformation);
+}
+
+void QGraphicsPixmapToggle::toggle()
+{
+  m_toggled = !m_toggled;
+  setPixmap(m_toggled ? m_pressed : m_released);
+}
+
+void QGraphicsPixmapToggle::setState(bool toggled)
+{
+  if(toggled != m_toggled)
+  {
+    m_toggled = toggled;
+    setPixmap(m_toggled ? m_pressed : m_released);
+  }
+}
+
+void QGraphicsPixmapToggle::mousePressEvent(QGraphicsSceneMouseEvent* event)
+{
+  m_toggled = !m_toggled;
+  setPixmap(m_toggled ? m_pressed : m_released);
+  toggled(m_toggled);
+  event->accept();
+}
+
+void QGraphicsPixmapToggle::mouseMoveEvent(QGraphicsSceneMouseEvent* event)
+{
+  event->accept();
+}
+
+void QGraphicsPixmapToggle::mouseReleaseEvent(QGraphicsSceneMouseEvent* event)
+{
+  event->accept();
+}
+}

@@ -1,0 +1,169 @@
+id: io.ossia.score
+runtime: org.kde.Platform
+runtime-version: "6.10"
+sdk: org.kde.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.llvm21
+build-options:
+  env:
+    CXX: /usr/lib/sdk/llvm21/bin/clang++
+command: ossia-score
+rename-desktop-file: ossia-score.desktop
+rename-icon: ossia-score
+rename-appdata-file: ossia-score.appdata.xml
+finish-args:
+  # BLE support
+  - --allow=bluetooth
+  - --system-talk-name=org.bluez
+
+  # Access user's data and media libraries, plug-ins etc
+  - --filesystem=host
+
+  # Required for USB, Webcam devices support as well as raw GPIO I/O & GPU rendering
+  - --device=all
+
+  # X11 is used by default
+  - --socket=x11
+
+  # Wayland is available
+  - --socket=wayland
+
+  # Used by X11
+  - --share=ipc
+
+  # Network access
+  - --share=network
+
+  # PulseAudio is needed for ALSA device access
+  - --socket=pulseaudio
+
+  # Audio support through pipewire
+  - --filesystem=xdg-run/pipewire-0
+
+  # Plugins
+  - --env=VST_PATH=/app/extensions/Plugins/vst
+  - --env=VST3_PATH=/app/extensions/Plugins/vst3
+
+  # Required to allow screensaver/idle inhibition
+  - --talk-name=org.freedesktop.ScreenSaver
+
+add-extensions:
+  # Linux audio plugins base extension
+  org.freedesktop.LinuxAudio.Plugins:
+    directory: extensions/Plugins
+    version: "24.08"
+    add-ld-path: lib
+    merge-dirs: vst;vst3;lv2
+    subdirectories: true
+    no-autodownload: true
+
+cleanup:
+  - /bin/avahi*
+  - "*.a"
+  - "*.la"
+  - "*.java"
+  - "*.d"
+  - "*.cs"
+  - "/share/faust/*.cpp"
+  - "/share/faust/*.h"
+  - /share/faust/api
+  - /share/faust/AU
+  - /share/faust/audiokit
+  - /share/faust/autodiff
+  - /share/faust/chaos-stratus
+  - /share/faust/cmajor
+  - /share/faust/daisy
+  - /share/faust/esp32
+  - /share/faust/examples
+  - /share/faust/iOS
+  - /share/faust/juce
+  - /share/faust/julia
+  - /share/faust/max-msp
+  - /share/faust/nodejs
+  - /share/faust/osclib
+  - /share/faust/sam
+  - /share/faust/smartKeyboard
+  - /share/faust/juce
+  - /share/faust/svgplot
+  - /share/faust/teensy
+  - /share/faust/unity
+  - /share/faust/rust
+  - /share/faust/vcvrack
+  - /share/faust/webaudio
+  - /share/faust/js
+  - /lib/cmake
+  - /lib/girepository-1.0
+  - /lib/pkgconfig
+  - /lib/avahi
+  - /lib/python*
+  - /share/gir-1.0
+  - /share/man
+  - /share/pkgconfig
+  - /share/aclocal
+  - /share/gtk-doc
+  - /share/doc
+  - /share/info
+  - /share/pixmaps
+  - /share/async-mqtt5
+  - /man
+
+modules:
+  # LV2 audio plugin support
+  - shared-modules/linux-audio/lv2.json
+  - shared-modules/linux-audio/lilv.json
+  - modules/dr_libs.yaml
+  - modules/portaudio.yaml
+  - modules/libsamplerate.yaml
+  - modules/rubberband.yaml
+  - modules/rapidfuzz-cpp.yaml
+  - modules/abseil-cpp.yaml
+  - modules/re2.yaml
+  - modules/libcoap.yaml
+  - modules/boost.yaml
+  - modules/snappy.yaml
+  - modules/avahi.yaml
+  - modules/suil.yaml
+  - modules/spdlog.yaml
+  - modules/hdf5.yaml
+  - modules/highfive.yaml
+  - modules/ysfx.yaml
+  - modules/faust.yaml
+
+  - name: ossia-score
+    buildsystem: cmake-ninja
+    builddir: true
+    sources:
+      - type: dir
+        path: ../../../../
+
+      - type: script
+        dest-filename: run
+        commands:
+          - export LV2_PATH=$HOME/.lv2:/app/extensions/Plugins/lv2:/app/lib/lv2
+          - exec ossia-score.bin "$@"
+
+    config-opts:
+      # Note: don't use RelWithDebInfo as ossia release builds explicitly expect Release build type.
+      - -DCMAKE_BUILD_TYPE=Release
+      - -Wno-dev
+      - -DCMAKE_PREFIX_PATH=/usr/lib/sdk/llvm21
+      - -DLLVM_CONFIG=/usr/lib/sdk/llvm21/bin/llvm-config
+      - -DSCORE_DEPLOYMENT_BUILD=1
+      - -DSCORE_STATIC_PLUGINS=1
+      - -DSCORE_FHS_BUILD=1
+      - -DCMAKE_UNITY_BUILD=1
+      - -DCMAKE_SKIP_RPATH=ON
+      - -DOSSIA_USE_SYSTEM_LIBRARIES=1
+      - -DSCORE_USE_SYSTEM_LIBRARIES=1
+      - -DSCORE_NO_QTCONF=1
+      - -DCMAKE_CXX_FLAGS="-Wl,--strip-all"
+      - -DBOOST_ROOT="${FLATPAK_DEST}/include"
+
+    post-install:
+      - install -Dm755 "${FLATPAK_DEST}/bin/ossia-score" "${FLATPAK_DEST}/bin/ossia-score.bin"
+      - install -Dm755 /usr/lib/sdk/llvm21/lib/libLLVM.so.21.1 "${FLATPAK_DEST}/lib/"
+      - install -Dm755 /usr/lib/sdk/llvm21/lib/libclang-cpp.so.21.1 "${FLATPAK_DEST}/lib/"
+      - cp -rf /usr/lib/sdk/llvm21/include/* "${FLATPAK_DEST}/include/"
+      - cp -rf /usr/include/* "${FLATPAK_DEST}/include/"
+      - install -Dm755 ../run "${FLATPAK_DEST}/bin/ossia-score"
+      - install -d /app/extensions/Plugins

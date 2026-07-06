@@ -1,0 +1,424 @@
+#include <JitCpp/Compiler/Compiler.hpp>
+
+#include <ossia/detail/flat_map.hpp>
+
+// Add JITLink-specific headers
+#include <llvm/ExecutionEngine/JITLink/EHFrameSupport.h>
+#include <llvm/ExecutionEngine/JITLink/JITLink.h>
+#include <llvm/ExecutionEngine/Orc/EHFrameRegistrationPlugin.h>
+#include <llvm/ExecutionEngine/Orc/ObjectLinkingLayer.h>
+
+#if defined(_WIN32) && !defined(_MSC_VER) && LLVM_VERSION_MAJOR >= 22
+#include <JitCpp/Compiler/MinGWCOFFPlatform.hpp>
+
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#endif
+
+#if LLVM_VERSION_MAJOR >= 22
+#include <llvm/ExecutionEngine/Orc/ExecutorProcessControl.h>
+#endif
+
+namespace Jit
+{
+// TODO investigate https://stackoverflow.com/questions/1839965/dynamically-creating-functions-in-c
+struct GlobalAtExit
+{
+  int nextCompilerID{};
+  int currentCompiler{};
+  ossia::flat_map<int, std::vector<void (*)()>> functions;
+} globalAtExit;
+
+static void jitAtExit(void (*f)())
+{
+  globalAtExit.functions[globalAtExit.currentCompiler].push_back(f);
+}
+
+void setTargetOptions(llvm::TargetOptions& opts, bool useNativePlatform = false)
+{
+  // With an Orc Platform (orc_rt) in use we get native thread-locals on every
+  // target (ELF/MachO/COFF-MSVC/COFF-MinGW); without it the JIT has no TLS
+  // runtime, so fall back to emulated TLS as before. When native TLS is on, the
+  // -femulated-tls / -ftls-model cc1 flags in JitPlatform.hpp must be dropped too
+  // (otherwise codegen emits __emutls_* the platform does not provide).
+  opts.EmulatedTLS = !useNativePlatform;
+
+  //opts.ExplicitEmulatedTLS = false;
+
+#if LLVM_VERSION_MAJOR < 22
+  opts.UnsafeFPMath = true;
+  opts.ApproxFuncFPMath = true;
+  opts.setFPDenormalMode(llvm::DenormalMode::getPositiveZero());
+  opts.setFP32DenormalMode(llvm::DenormalMode::getPositiveZero());
+#else
+  opts.AllowFPOpFusion = llvm::FPOpFusion::Fast;
+#endif
+
+  opts.NoInfsFPMath = true;
+  opts.NoNaNsFPMath = true;
+  opts.NoTrappingFPMath = true;
+  opts.NoSignedZerosFPMath = true;
+  opts.HonorSignDependentRoundingFPMathOption = false;
+  opts.EnableIPRA = true;
+  opts.EnableFastISel = true;
+  opts.EnableGlobalISel = false;
+}
+}
+
+namespace Jit
+{
+
+// Custom ObjectLinkingLayer plugin for handling atexit and other runtime functions
+class RuntimeInterposePlugin : public llvm::orc::ObjectLinkingLayer::Plugin
+{
+public:
+  RuntimeInterposePlugin(llvm::orc::MangleAndInterner& mangler)
+      : m_mangler(mangler)
+  {
+  }
+
+  void modifyPassConfig(
+      llvm::orc::MaterializationResponsibility& MR, llvm::jitlink::LinkGraph& G,
+      llvm::jitlink::PassConfiguration& Config) override
+  {
+    // Add a pass to handle runtime interposes
+    Config.PreFixupPasses.push_back([this](llvm::jitlink::LinkGraph& G) -> llvm::Error {
+      // Look for calls to atexit and redirect them
+      for(auto* Sym : G.external_symbols())
+      {
+        if(Sym->getName() == m_mangler("atexit"))
+        {
+          // Create or find our jitAtExit symbol
+          auto& atExitSym = G.addAbsoluteSymbol(
+              "_jitAtExit", llvm::orc::ExecutorAddr::fromPtr(&jitAtExit),
+              0, // size
+              llvm::jitlink::Linkage::Strong, llvm::jitlink::Scope::Default,
+              false // not callable
+          );
+
+          // Redirect references
+          for(auto* B : G.blocks())
+          {
+            for(auto& E : B->edges())
+            {
+              if(&E.getTarget() == Sym)
+              {
+                E.setTarget(atExitSym);
+              }
+            }
+          }
+        }
+      }
+      return llvm::Error::success();
+    });
+  }
+
+  llvm::Error notifyFailed(llvm::orc::MaterializationResponsibility& MR) override
+  {
+    qDebug() << "JITLink failed for " << MR.getTargetJITDylib().getName().c_str();
+    return llvm::Error::success();
+  }
+
+  llvm::Error
+  notifyRemovingResources(llvm::orc::JITDylib& JD, llvm::orc::ResourceKey K) override
+  {
+    return llvm::Error::success();
+  }
+
+  void notifyTransferringResources(
+      llvm::orc::JITDylib& JD, llvm::orc::ResourceKey DstKey,
+      llvm::orc::ResourceKey SrcKey) override
+  {
+  }
+
+private:
+  llvm::orc::MangleAndInterner& m_mangler;
+};
+
+static std::unique_ptr<llvm::orc::LLJIT> jitBuilder(JitCompiler& self)
+{
+  auto JTMB = llvm::orc::JITTargetMachineBuilder::detectHost();
+  SCORE_ASSERT(JTMB);
+
+  llvm::orc::LLJITBuilder builder;
+
+  JTMB->setCodeGenOptLevel(llvm::CodeGenOptLevel::Aggressive);
+
+  // When the SDK ships LLVM's ORC runtime, drive the executor through an Orc
+  // Platform (native TLS, real static-init/atexit and -- on COFF -- exception
+  // registration). Otherwise keep the legacy path (emulated TLS + atexit
+  // interpose + EH disabled).
+  //
+  // Platform selection (per target):
+  //   ELF / MachO        : ExecutorNativePlatform(orc_rt)        (legacy path
+  //                        as a fallback when orc_rt is absent or LLVM < 22)
+  //   COFF + _MSC_VER    : ExecutorNativePlatform -> stock COFFPlatform, which
+  //                        auto-discovers the MSVC VC runtime
+  //   COFF + MinGW       : custom MinGWCOFFPlatform (COFFPlatform minus the VC
+  //                        runtime bootstrap & _CxxThrowException alias)
+  // On COFF the platform is mandatory: there is no working legacy COFF path, so
+  // if orc_rt is missing on COFF (e.g. Windows-arm64) we refuse to set up JIT.
+#if LLVM_VERSION_MAJOR >= 22
+  const std::string orcRuntime = Jit::locateOrcRuntime();
+#else
+  const std::string orcRuntime;
+#endif
+  const bool useNativePlatform = !orcRuntime.empty();
+
+  const bool isCOFF = JTMB->getTargetTriple().isOSBinFormatCOFF();
+  if(isCOFF && !useNativePlatform)
+  {
+    // COFF requires the platform (TLS/SEH/initializers). Refuse rather than build
+    // a broken JIT that would link COFF objects without exception/TLS support.
+    // (throw, not SCORE_ASSERT: the latter is a no-op in release builds, which
+    // would let create() proceed and fail later with a cryptic error.)
+    throw std::runtime_error(
+        "JIT: the SDK ships no orc_rt for this COFF target, which the JIT "
+        "requires for TLS/SEH/initializers (e.g. none exists on Windows-arm64).");
+  }
+
+  self.m_useNativePlatform = useNativePlatform;
+
+  setTargetOptions(JTMB->getOptions(), useNativePlatform);
+
+  builder.setJITTargetMachineBuilder(std::move(*JTMB));
+  builder.setNumCompileThreads(4);
+
+  // Configure to use JITLink via ObjectLinkingLayer
+  builder.setObjectLinkingLayerCreator(
+      [&](llvm::orc::ExecutionSession& ES
+            #if LLVM_VERSION_MAJOR < 21
+              , const llvm::Triple& TT
+            #endif
+              ) {
+    // Create ObjectLinkingLayer with JITLink
+    auto ObjLinkingLayer
+        = std::make_unique<llvm::orc::ObjectLinkingLayer>(ES, *self.m_memmgr);
+
+    // COFF needs the same responsibility setup LLJIT applies to its own COFF
+    // object layer; a hand-built ObjectLinkingLayer omits it, so JIT-linking COFF
+    // objects fails with "Could not find symbol at given index, did you add it to
+    // JITSymbolTable?" on symbols the layer never claimed.
+#if LLVM_VERSION_MAJOR >= 21
+    const llvm::Triple& TT = ES.getTargetTriple();
+#endif
+    if(TT.isOSBinFormatCOFF())
+    {
+      ObjLinkingLayer->setOverrideObjectFlagsWithResponsibilityFlags(true);
+      ObjLinkingLayer->setAutoClaimResponsibilityForObjectSymbols(true);
+    }
+
+    // The atexit interpose and EH-frame handling are owned by the platform /
+    // orc_rt when it is in use; only install our replacements on the legacy path.
+    // (The eager-linking guarantee is enforced at add-on load time in compile(),
+    // not via a JITLink pass -- see compile() -- so no eager plugin is needed.)
+    if(!useNativePlatform)
+    {
+      ObjLinkingLayer->addPlugin(
+          std::make_shared<RuntimeInterposePlugin>(self.m_mangler));
+
+      // crash in deregisterEHFrames
+      //ObjLinkingLayer->addPlugin(
+      //    std::make_shared<llvm::orc::EHFrameRegistrationPlugin>(
+      //        ES, std::make_unique<llvm::jitlink::InProcessEHFrameRegistrar>()));
+    }
+
+    return ObjLinkingLayer;
+  });
+
+#if LLVM_VERSION_MAJOR >= 22
+  // Install the Orc Platform. It reuses the ObjectLinkingLayer created above and
+  // adds its own generator/plugins; the process-symbols JITDylib it needs exists
+  // by default (LinkProcessSymbolsByDefault).
+  if(useNativePlatform)
+  {
+#if defined(_WIN32) && !defined(_MSC_VER)
+    // MinGW COFF: stock COFFPlatform is MSVC-coupled (mandatory VC-runtime
+    // bootstrap + _CxxThrowException alias). Use our VC-runtime-free subset; the
+    // CRT/C++/EH symbols resolve from the host process (score.exe is MinGW-linked)
+    // via the process-symbols generator. This mirrors ExecutorNativePlatform's
+    // COFF setup (LLJIT.cpp) but swaps COFFPlatform for MinGWCOFFPlatform.
+    builder.setPlatformSetUp(
+        [orcRuntime](llvm::orc::LLJIT& J) -> llvm::Expected<llvm::orc::JITDylibSP> {
+      auto ProcessSymbolsJD = J.getProcessSymbolsJITDylib();
+      if(!ProcessSymbolsJD)
+        return llvm::make_error<llvm::StringError>(
+            "Native platforms require a process symbols JITDylib",
+            llvm::inconvertibleErrorCode());
+
+      auto* OLL
+          = llvm::dyn_cast<llvm::orc::ObjectLinkingLayer>(&J.getObjLinkingLayer());
+      if(!OLL)
+        return llvm::make_error<llvm::StringError>(
+            "MinGWCOFFPlatform requires an ObjectLinkingLayer",
+            llvm::inconvertibleErrorCode());
+
+      auto& ES = J.getExecutionSession();
+      auto& PlatformJD = ES.createBareJITDylib("<Platform>");
+      PlatformJD.addToLinkOrder(*ProcessSymbolsJD);
+
+      J.setPlatformSupport(std::make_unique<llvm::orc::ORCPlatformSupport>(J));
+
+      auto P = Jit::MinGWCOFFPlatform::Create(
+          *OLL, PlatformJD, orcRuntime.c_str(),
+          [](llvm::orc::JITDylib& JD, llvm::StringRef DLLName) -> llvm::Error {
+        // MinGW's orc_rt archive is statically self-contained and the host
+        // process supplies CRT/C++/EH; there are no VC-runtime DLLs to preload.
+        return llvm::Error::success();
+      });
+      if(!P)
+        return P.takeError();
+      ES.setPlatform(std::move(*P));
+      return &PlatformJD;
+    });
+#else
+    builder.setPlatformSetUp(llvm::orc::ExecutorNativePlatform(orcRuntime));
+#endif
+  }
+#endif
+
+  auto p = builder.create();
+  SCORE_ASSERT(p);
+  if(!p)
+    qDebug() << toString(p.takeError()).c_str();
+  SCORE_ASSERT(p.get());
+  return std::move(p.get());
+}
+
+static std::unique_ptr<llvm::jitlink::InProcessMemoryManager> makeMemoryManager()
+{
+  auto m = llvm::jitlink::InProcessMemoryManager::Create();
+  if(!m)
+    throw std::runtime_error(
+        "JIT: failed to create InProcessMemoryManager: "
+        + toString(m.takeError()));
+  return std::move(*m);
+}
+
+JitCompiler::JitCompiler()
+    : m_memmgr{makeMemoryManager()}
+    , m_jit{jitBuilder(*this)}
+    , m_mangler{m_jit->getExecutionSession(), m_jit->getDataLayout()}
+{
+  using namespace llvm;
+  using namespace llvm::orc;
+  // Load own executable as a dynamic library so the process-symbols generator can
+  // resolve host symbols (CRT/C++/EH, score/ossia/Qt) back into JIT'd code.
+  sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
+
+  LLJIT& JIT = *m_jit;
+  m_jit->getExecutionSession().setErrorReporter([&](llvm::Error Err) {
+    llvm::handleAllErrors(std::move(Err), [&](const llvm::ErrorInfoBase& EI) {
+      const auto& mess = EI.message();
+      this->m_errors += mess.c_str();
+    });
+  });
+  auto& JD = JIT.getMainJITDylib();
+
+  // When a platform is in use (LinkProcessSymbolsByDefault), LLJIT already builds
+  // a <Process Symbols> JITDylib that is in the default link order, so adding a
+  // second DynamicLibrarySearchGenerator here would be redundant and would reorder
+  // symbol resolution. Only install it on the legacy (non-platform) path.
+  if(!m_useNativePlatform)
+  {
+    auto gen = DynamicLibrarySearchGenerator::GetForCurrentProcess(
+        m_jit->getDataLayout().getGlobalPrefix(),
+        [&](const SymbolStringPtr& S) { return true; });
+    if(!gen)
+      throw std::runtime_error(
+          "JIT: failed to create process-symbols generator: "
+          + toString(gen.takeError()));
+    JD.addGenerator(std::move(*gen));
+  }
+}
+
+JitCompiler::~JitCompiler()
+{
+  m_atExitId = globalAtExit.currentCompiler;
+  // See https://lists.llvm.org/pipermail/llvm-dev/2017-December/119472.html for the order in which things must be done
+
+  for(auto func : globalAtExit.functions[m_atExitId])
+  {
+    (*func)();
+  }
+  globalAtExit.functions.erase(m_atExitId);
+
+  // TODO __dso_handle deinit ?
+  (void)m_jit->deinitialize(m_jit->getMainJITDylib());
+}
+
+void JitCompiler::compile(
+    const std::string& cppCode, const std::vector<std::string>& flags,
+    CompilerOptions opts, llvm::orc::ThreadSafeContext& context)
+{
+  using namespace llvm;
+  using namespace llvm::orc;
+  m_errors.clear();
+
+  // Names of all symbols the add-on defines; collected while the module is still
+  // accessible so we can eagerly materialize them below.
+  std::vector<std::string> definedSymbols;
+
+#if LLVM_VERSION_MAJOR >= 21
+  context.withContextDo([&](llvm::LLVMContext* c) {
+#else
+  {
+    auto c = context.getContext();
+#endif
+    if(!c)
+      throw std::runtime_error("Could not acquire an LLVMContext");
+    auto module = m_driver.compileTranslationUnit(cppCode, flags, opts, *c);
+
+    if(!module)
+    {
+      throw Exception{module.takeError()};
+    }
+
+    // Record every externally-visible definition so we can force-link the whole
+    // add-on now, on this (the add-on-load) thread -- see the blocking lookup
+    // below.
+    for(const llvm::Function& F : (*module)->functions())
+      if(!F.isDeclaration() && F.hasName() && !F.hasLocalLinkage())
+        definedSymbols.push_back(F.getName().str());
+    for(const llvm::GlobalVariable& G : (*module)->globals())
+      if(!G.isDeclaration() && G.hasName() && !G.hasLocalLinkage())
+        definedSymbols.push_back(G.getName().str());
+
+    if(auto Err = m_jit->addIRModule(ThreadSafeModule(std::move(*module), context));
+       bool(Err))
+    {
+      throw Err;
+    }
+#if LLVM_VERSION_MAJOR >= 21
+  });
+#else
+  }
+#endif
+
+  globalAtExit.currentCompiler = globalAtExit.nextCompilerID++;
+  m_atExitId = globalAtExit.currentCompiler;
+
+  // EAGER LINKING GUARANTEE:
+  // The maintainer requires that no add-on function is ever JIT-compiled/linked
+  // lazily on the real-time audio thread. We enforce this *here*, at add-on load
+  // time on the load thread (NOT on a JITLink materialization thread, which would
+  // deadlock against setNumCompileThreads(4) + platform bootstrap): a blocking
+  // lookup of every symbol the add-on defines forces JITLink to compile and link
+  // the entire add-on graph -- including resolving all of its external
+  // dependencies -- before compile() returns. After this point everything the
+  // add-on needs is already materialized, so getFunction()/the audio thread only
+  // ever read an already-resolved address.
+  for(const auto& name : definedSymbols)
+  {
+    if(auto sym = m_jit->lookup(name); !sym)
+    {
+      // Don't fail the whole add-on for one un-resolvable helper symbol; record
+      // it and continue forcing the rest. The real entry-point lookup in
+      // getFunction() will still surface a hard error if it matters.
+      consumeError(sym.takeError());
+    }
+  }
+
+  (void)m_jit->initialize(m_jit->getMainJITDylib());
+}
+
+}

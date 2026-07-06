@@ -1,0 +1,763 @@
+#pragma once
+#include <State/Value.hpp>
+
+#include <ossia/detail/parse_strict.hpp>
+#include <ossia/network/value/detail/value_conversion_impl.hpp>
+
+#include <QDateTime>
+#include <QFile>
+
+#include <AvndProcesses/AddressTools.hpp>
+#include <AvndProcesses/Utils.hpp>
+#include <csv2/csv2.hpp>
+#include <halp/audio.hpp>
+
+namespace avnd_tools
+{
+struct fmt_csv_writer
+{
+  fmt::memory_buffer& wr;
+
+  void operator()(ossia::impulse) const
+  {
+    fmt::format_to(fmt::appender(wr), "impulse");
+  }
+
+  void operator()(int32_t v) const
+  {
+    fmt::format_to(fmt::appender(wr), "{}", v);
+  }
+
+  void operator()(float v) const
+  {
+    fmt::format_to(fmt::appender(wr), "{}", v);
+  }
+
+  void operator()(bool v) const
+  {
+    fmt::format_to(fmt::appender(wr), "{}", v ? "true" : "false");
+  }
+
+  void operator()(const std::string& v) const
+  {
+    if(v.find_first_of(",\"\n\r") != std::string::npos)
+    {
+      fmt::format_to(fmt::appender(wr), "\"");
+      for(char c : v)
+      {
+        if(c == '"')
+          fmt::format_to(fmt::appender(wr), "\"\""); // CSV escapes quotes by doubling
+        else
+          fmt::format_to(fmt::appender(wr), "{}", c);
+      }
+      fmt::format_to(fmt::appender(wr), "\"");
+    }
+    else
+    {
+      fmt::format_to(fmt::appender(wr), "{}", v);
+    }
+  }
+
+  void operator()() const
+  {
+    fmt::format_to(fmt::appender(wr), "\"\"");
+  }
+
+  template <std::size_t N>
+  void operator()(std::array<float, N> v) const
+  {
+    fmt::format_to(fmt::appender(wr), "\"[{}",  v[0]);
+    for(std::size_t i = 1; i < N; i++)
+      fmt::format_to(fmt::appender(wr), ", {}", v[i]);
+    fmt::format_to(fmt::appender(wr), "]\"");
+  }
+
+  void operator()(const std::vector<ossia::value>& v) const
+  {
+    // Vector as quoted JSON-like string for CSV
+    fmt::format_to(fmt::appender(wr), "\"[");
+    const auto n = v.size();
+    if(n > 0)
+    {
+      v[0].apply(*this);
+      for(std::size_t i = 1; i < n; i++)
+      {
+        fmt::format_to(fmt::appender(wr), ", ");
+        v[i].apply(*this);
+      }
+    }
+    fmt::format_to(fmt::appender(wr), "]\"");
+  }
+
+  void operator()(const ossia::value_map_type& v) const
+  {
+    // Map as quoted JSON-like string for CSV
+    fmt::format_to(fmt::appender(wr), "\"{{");
+    const auto n = v.size();
+    if(n > 0)
+    {
+      auto it = v.begin();
+      fmt::format_to(fmt::appender(wr), "\\\"{}\\\" : ", it->first);
+      it->second.apply(*this);
+      for(++it; it != v.end(); ++it)
+      {
+        fmt::format_to(fmt::appender(wr), ", \\\"{}\\\" : ", it->first);
+        it->second.apply(*this);
+      }
+    }
+    fmt::format_to(fmt::appender(wr), "}}\"");
+  }
+};
+/** Records the input into a CSV.
+ *  To record an entire device: can be a pattern expression such as foo://
+ *
+ *  Writing to the disk is done in a worker thread as is tradition.
+ */
+struct DeviceRecorder : PatternObject
+{
+  halp_meta(name, "CSV")
+  halp_meta(author, "ossia team")
+  halp_meta(category, "Control/Data files")
+  halp_meta(description, "Record the messages of a device at regular interval")
+  halp_meta(c_name, "avnd_device_recorder")
+  halp_meta(uuid, "7161ca22-5684-48f2-bde7-88933500a7fb")
+  halp_meta(manual_url, "https://ossia.io/score-docs/processes/csv-recorder.html#csv-recorder")
+
+  enum Separator
+  {
+    Colon,
+    Semicolon,
+    Pipe,
+  };
+
+  // Threaded worker
+  struct recorder_thread
+  {
+    explicit recorder_thread(const score::DocumentContext& context)
+        : context{context}
+    {
+    }
+    const score::DocumentContext& context;
+    QFile f{};
+    std::string filename;
+    std::vector<ossia::net::node_base*> roots;
+    std::chrono::steady_clock::time_point first_ts;
+    fmt::memory_buffer buf;
+    bool active{};
+    bool first_is_timestamp = false;
+    char separator{','};
+    int num_params = 0;
+
+    void setSeparator(Separator sep) noexcept
+    {
+      switch(sep)
+      {
+        default:
+        case Separator::Colon:
+          this->separator = ',';
+          break;
+        case Separator::Semicolon:
+          this->separator = ';';
+          break;
+        case Separator::Pipe:
+          this->separator = '|';
+          break;
+      }
+    }
+
+    void setActive(bool b)
+    {
+      active = b;
+      if(!b)
+        f.close();
+      else
+        reopen();
+    }
+
+    void reopen()
+    {
+      f.close();
+
+      f.setFileName(filter_filename(this->filename, context));
+      if(f.fileName().isEmpty())
+        return;
+
+      if(!active)
+        return;
+
+      f.open(QIODevice::WriteOnly);
+      if(!f.isOpen())
+        return;
+
+      f.write("timestamp");
+      num_params = 0;
+      for(auto in : this->roots)
+      {
+        if(auto p = in->get_parameter())
+        {
+          f.write(&separator, 1);
+          f.write(QByteArray::fromStdString(p->get_node().osc_address()));
+
+          num_params++;
+        }
+      }
+      f.write("\n");
+      f.flush();
+
+      first_ts = std::chrono::steady_clock::now();
+      buf.clear();
+      buf.reserve(512);
+    }
+
+    void write()
+    {
+      if(!f.isOpen())
+        return;
+
+      using namespace std::chrono;
+      const auto ts
+          = duration_cast<milliseconds>(steady_clock::now() - first_ts).count();
+      write(ts);
+    }
+
+    void write(int64_t timestamp)
+    {
+      f.write(QString::number(timestamp).toUtf8());
+      std::string separator_bufs = "\"\n\r\t";
+      separator_bufs += this->separator;
+      for(auto in : this->roots)
+      {
+        if(auto p = in->get_parameter())
+        {
+          f.write(&separator, 1);
+          buf.clear();
+
+          ossia::apply(fmt_csv_writer{buf}, p->value());
+          f.write(buf.data(), buf.size());
+        }
+      }
+      f.write("\n");
+      f.flush();
+    }
+  };
+
+  struct player_thread
+  {
+    explicit player_thread(const score::DocumentContext& context)
+        : context{context}
+    {
+    }
+    const score::DocumentContext& context;
+    QFile f{};
+    std::string filename;
+    std::vector<ossia::net::node_base*> roots;
+    std::chrono::steady_clock::time_point first_ts;
+    int64_t nots_index{};
+
+    // FIXME boost::multi_array
+    boost::container::flat_map<int, ossia::net::parameter_base*> m_map;
+    boost::container::flat_map<int64_t, std::vector<ossia::value>> m_vec_ts;
+    std::vector<std::vector<ossia::value>> m_vec_no_ts;
+    bool active{};
+    bool loops{};
+    bool first_is_timestamp = false;
+    char separator{','};
+    int num_params{};
+
+    void setSeparator(Separator sep) noexcept
+    {
+      switch(sep)
+      {
+        default:
+        case Separator::Colon:
+          this->separator = ',';
+          break;
+        case Separator::Semicolon:
+          this->separator = ';';
+          break;
+        case Separator::Pipe:
+          this->separator = '|';
+          break;
+      }
+    }
+
+    void setActive(bool b)
+    {
+      active = b;
+      if(!b)
+        f.close();
+      else
+        reopen();
+    }
+
+    void setLoops(bool b) { loops = b; }
+
+    template <typename CsvReader>
+    void read(std::string_view data)
+    {
+      CsvReader r;
+      r.parse_view(data);
+      int columns = r.cols();
+
+      auto header = r.header();
+
+      boost::container::flat_map<std::string, ossia::net::parameter_base*> params;
+
+      for(auto node : roots)
+        if(auto p = node->get_parameter())
+          params[node->osc_address()] = p;
+
+      std::string v;
+      v.reserve(128);
+      int i = 0;
+      auto header_it = header.begin();
+      if(first_is_timestamp)
+      {
+        // this library increments upon dereference...
+        // just doing ++header_it does not go to the next cell, but
+        // to the next character so we have to do it just when skipping the ,
+
+        *header_it;
+        ++header_it;
+      }
+
+      for(; header_it != header.end(); ++header_it)
+      {
+        auto addr = *header_it;
+        v.clear();
+        addr.read_raw_value(v);
+        if(auto it = params.find(v); it != params.end())
+        {
+          m_map[i] = it->second;
+        }
+        i++;
+      }
+
+      v.clear();
+      m_vec_ts.clear();
+      m_vec_no_ts.clear();
+      if(first_is_timestamp)
+      {
+        // FIXME confirm why we need to re-parse.
+        CsvReader r;
+        r.parse_view(data);
+        m_vec_ts.reserve(r.rows());
+        for(const auto& row : r)
+        {
+          parse_row_with_timestamps(columns, row, v);
+          v.clear();
+        }
+      }
+      else
+      {
+        m_vec_no_ts.reserve(r.rows());
+        for(const auto& row : r)
+        {
+          parse_row_no_timestamps(columns, row, v);
+          v.clear();
+        }
+      }
+      first_ts = std::chrono::steady_clock::now();
+    }
+
+    void reopen()
+    {
+      f.close();
+
+      f.setFileName(filter_filename(this->filename, context));
+      if(f.fileName().isEmpty())
+        return;
+
+      if(!active)
+        return;
+
+      if(!f.open(QIODevice::ReadOnly))
+        return;
+      if(f.size() <= 0)
+        return;
+
+      // FIXME not valid when the OSC device changes
+      // We need to parse the header instead and have a map.
+      num_params = 0;
+      for(auto in : this->roots)
+      {
+        if([[maybe_unused]] auto p = in->get_parameter())
+        {
+          num_params++;
+        }
+      }
+
+      auto data = (const char*)f.map(0, f.size());
+      m_map.clear();
+
+      switch(separator)
+      {
+        default:
+        case ',':
+          read<csv2::Reader<>>({data, data + f.size()});
+          break;
+        case ';':
+          read<csv2::Reader<csv2::delimiter<';'>>>({data, data + f.size()});
+          break;
+      }
+    }
+
+    void parse_cell_impl(
+        const std::string& v, ossia::net::parameter_base& param, ossia::value& out)
+    {
+      if(!v.empty())
+      {
+        std::optional<ossia::value> res;
+        if(v.starts_with('"') && v.ends_with('"'))
+          res = State::parseValue(std::string_view(v).substr(1, v.size() - 2));
+        else
+          res = State::parseValue(v);
+
+        if(res)
+        {
+          out = std::move(*res);
+          if(auto t = param.get_value_type(); out.get_type() != t)
+          {
+            ossia::convert(out, t);
+          }
+        }
+      }
+    }
+
+    void
+    parse_cell(const auto& cell, std::string& v, std::vector<ossia::value>& vec, int i)
+    {
+      if(auto param = m_map[i])
+      {
+        v.clear();
+        cell.read_value(v);
+        parse_cell_impl(v, *param, vec[i]);
+        v.clear();
+      }
+    }
+
+    void parse_row_no_timestamps(int columns, auto& row, std::string& v)
+    {
+      auto& vec = this->m_vec_no_ts.emplace_back(columns);
+      int i = 0;
+
+      for(auto it = row.begin(); it != row.end(); ++it)
+      {
+        parse_cell(*it, v, vec, i);
+        i++;
+      }
+    }
+
+    void parse_row_with_timestamps(int columns, auto& row, std::string& v)
+    {
+      if(row.length() <= 1)
+        return;
+
+      auto it = row.begin();
+      const auto& ts = *it;
+
+      v.clear();
+      ts.read_value(v);
+      auto tstamp = ossia::parse_strict<int64_t>(v);
+      if(!tstamp)
+        return;
+      v.clear();
+      auto& vec = this->m_vec_ts[*tstamp];
+      vec.resize(columns - 1);
+      int i = 0;
+
+      for(++it; it != row.end(); ++it)
+      {
+        parse_cell(*it, v, vec, i);
+        i++;
+      }
+    }
+
+    void read()
+    {
+      if(first_is_timestamp)
+      {
+        if(m_vec_ts.empty())
+          return;
+
+        using namespace std::chrono;
+        auto ts = duration_cast<milliseconds>(steady_clock::now() - first_ts).count();
+        if(loops)
+          ts %= m_vec_ts.rbegin()->first + 1;
+        read_ts(ts);
+      }
+      else
+      {
+        if(m_vec_no_ts.empty())
+          return;
+
+        using namespace std::chrono;
+        if(loops && nots_index >= std::ssize(m_vec_no_ts))
+          nots_index = 0;
+        read_no_ts(nots_index++);
+      }
+    }
+
+    void read_no_ts(int64_t timestamp)
+    {
+      if(timestamp < 0)
+        return;
+      if(timestamp >= std::ssize(m_vec_no_ts))
+        return;
+      auto it = m_vec_no_ts.begin() + timestamp;
+      if(it != m_vec_no_ts.end())
+      {
+        int i = 0;
+        for(auto& v : *it)
+        {
+          if(v.valid())
+          {
+            if(auto p = m_map.find(i); p != m_map.end())
+            {
+              p->second->push_value(v);
+            }
+          }
+          i++;
+        }
+      }
+    }
+
+    void read_ts(int64_t timestamp)
+    {
+      auto it = m_vec_ts.lower_bound(timestamp);
+      if(it != m_vec_ts.end())
+      {
+        if(it != m_vec_ts.begin())
+          --it;
+        int i = 0;
+        for(auto& v : it->second)
+        {
+          if(v.valid())
+          {
+            if(auto p = m_map.find(i); p != m_map.end())
+            {
+              p->second->push_value(v);
+            }
+          }
+          i++;
+        }
+      }
+      else
+      {
+        int i = 0;
+        for(auto& v : m_vec_ts.rbegin()->second)
+        {
+          if(v.valid())
+          {
+            if(auto p = m_map.find(i); p != m_map.end())
+            {
+              p->second->push_value(v);
+            }
+          }
+          i++;
+        }
+      }
+    }
+  };
+
+  // Object definition
+  struct inputs_t
+  {
+    PatternSelector pattern;
+    halp::time_chooser<"Interval", halp::range{.min = 0.00001, .max = 5., .init = 0.25}>
+        time;
+    struct : halp::lineedit<"File pattern", "">
+    {
+      void update(DeviceRecorder& self) { self.update(); }
+    } filename;
+    struct
+    {
+      halp__enum("Mode", None, None, Record, Playback, Loop)
+      void update(DeviceRecorder& self) { self.setMode(); }
+    } mode;
+    struct ts : halp::toggle<"Timestamped", halp::default_on_toggle>
+    {
+      halp_meta(description, "Set to true to use the first column as timestamp")
+    } timestamped;
+
+    halp::enum_t<Separator, "Separator"> separator;
+  } inputs;
+
+  struct
+  {
+  } outputs;
+
+  struct reset_message
+  {
+    std::shared_ptr<recorder_thread> recorder;
+    std::shared_ptr<player_thread> player;
+    std::string path;
+    std::vector<ossia::net::node_base*> roots;
+    bool first_is_timestamp{};
+    Separator separator{};
+
+    void operator()()
+    {
+      using namespace std;
+      swap(recorder->filename, path);
+      swap(recorder->roots, roots);
+      player->filename = recorder->filename;
+      player->roots = recorder->roots;
+      player->first_is_timestamp = first_is_timestamp;
+      player->setSeparator(separator);
+
+      recorder->first_is_timestamp = first_is_timestamp;
+      recorder->setSeparator(separator);
+
+      recorder->reopen();
+      player->reopen();
+    }
+  };
+
+  struct reset_path_message
+  {
+    std::shared_ptr<recorder_thread> recorder;
+    std::shared_ptr<player_thread> player;
+    std::string path;
+    bool first_is_timestamp{};
+    Separator separator{};
+    void operator()()
+    {
+      using namespace std;
+      swap(recorder->filename, path);
+
+      player->filename = recorder->filename;
+      player->first_is_timestamp = first_is_timestamp;
+      player->setSeparator(separator);
+
+      recorder->first_is_timestamp = first_is_timestamp;
+      recorder->setSeparator(separator);
+
+      recorder->reopen();
+      player->reopen();
+    }
+  };
+
+  struct process_message
+  {
+    std::shared_ptr<recorder_thread> recorder;
+    void operator()() { recorder->write(); }
+  };
+
+  struct playback_message
+  {
+    std::shared_ptr<player_thread> player;
+    void operator()() { player->read(); }
+  };
+
+  struct activate_message
+  {
+    std::shared_ptr<recorder_thread> recorder;
+    std::shared_ptr<player_thread> player;
+    using mode_type = decltype(DeviceRecorder::inputs_t{}.mode.value);
+    mode_type mode{};
+    Separator separator{Separator::Colon};
+    void operator()()
+    {
+      recorder->setSeparator(separator);
+      recorder->setActive(mode == mode_type::Record);
+      player->setSeparator(separator);
+      player->setActive(mode == mode_type::Playback || mode == mode_type::Loop);
+      player->setLoops(mode == mode_type::Loop);
+    }
+  };
+
+  using worker_message = ossia::variant<
+      std::unique_ptr<reset_message>, reset_path_message, process_message,
+      playback_message, activate_message>;
+
+  struct
+  {
+    std::function<void(worker_message)> request;
+    static void work(worker_message&& mess)
+    {
+      ossia::visit([&]<typename M>(M&& msg) {
+        if constexpr(requires { *msg; })
+          (*std::forward<M>(msg))();
+        else
+          std::forward<M>(msg)();
+      }, std::move(mess));
+    }
+  } worker;
+
+  using tick = halp::tick_musical;
+
+  void setMode()
+  {
+    if(!record_impl)
+      return;
+    worker.request(
+        activate_message{
+            record_impl, play_impl, inputs.mode.value, inputs.separator.value});
+  }
+
+  void prepare()
+  {
+    SCORE_ASSERT(ossia_document_context);
+    record_impl = std::make_shared<recorder_thread>(*ossia_document_context);
+    play_impl = std::make_shared<player_thread>(*ossia_document_context);
+    setMode();
+    update();
+  }
+
+  void update()
+  {
+    if(!record_impl)
+      return;
+    worker.request(
+        reset_path_message{
+            record_impl, play_impl, inputs.filename, inputs.timestamped,
+            inputs.separator});
+  }
+
+  void operator()(const halp::tick_musical& tk)
+  {
+    int64_t elapsed_ns = 0.;
+    if(!first_message_sent_pos)
+      first_message_sent_pos = tk.position_in_nanoseconds;
+    if(last_message_sent_pos)
+      elapsed_ns = tk.position_in_nanoseconds - *last_message_sent_pos;
+
+    if(elapsed_ns > 0 && elapsed_ns < inputs.time.value * 1e9)
+      return;
+    last_message_sent_pos = tk.position_in_nanoseconds;
+
+    if(m_paths.empty())
+      return;
+
+    if(!std::exchange(started, true))
+    {
+      inputs.pattern.reprocess();
+      worker.request(
+          std::unique_ptr<reset_message>(new reset_message{
+              record_impl, play_impl, inputs.filename, roots, inputs.timestamped,
+              inputs.separator}));
+    }
+
+    switch(inputs.mode)
+    {
+      case decltype(inputs.mode)::None:
+        break;
+      case decltype(inputs.mode)::Record:
+        worker.request(process_message{record_impl});
+        break;
+      case decltype(inputs.mode)::Playback:
+      case decltype(inputs.mode)::Loop:
+        worker.request(playback_message{play_impl});
+        break;
+    }
+  }
+
+  const score::DocumentContext* ossia_document_context{};
+  std::shared_ptr<recorder_thread> record_impl;
+  std::shared_ptr<player_thread> play_impl;
+  std::optional<int64_t> first_message_sent_pos;
+  std::optional<int64_t> last_message_sent_pos;
+  bool started{};
+};
+}

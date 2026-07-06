@@ -1,0 +1,462 @@
+
+#include <JS/Qml/Utils.hpp>
+
+#include <score/application/GUIApplicationContext.hpp>
+#include <score/tools/Cuda.hpp>
+#include <score/tools/File.hpp>
+#include <score/tools/MDMEnrollmentDetection.hpp>
+#include <score/tools/ThreadPool.hpp>
+
+#include <ossia/detail/algorithms.hpp>
+
+#include <QCoreApplication>
+#include <QDir>
+#include <QFile>
+#include <QFileDialog>
+#include <QFontMetrics>
+#include <QMainWindow>
+#include <QProcess>
+#include <QImageReader>
+#include <QUrl>
+#include <QTemporaryFile>
+#if __has_include(<PackageManager/Model.hpp>)
+#include <PackageManager/Model.hpp>
+#endif
+#include <rnd/random.hpp>
+
+#include <wobjectimpl.h>
+W_OBJECT_IMPL(JS::JsUtils)
+W_OBJECT_IMPL(JS::JsSystem)
+W_OBJECT_IMPL(JS::JsLibrary)
+namespace JS
+{
+
+QObject* JsUtils::settings(QString key)
+{
+  auto uuid = key.toLatin1();
+  if(uuid.length() != 36)
+    return nullptr;
+  auto uid = score::uuids::string_generator::compute(uuid.begin(), uuid.end());
+  if(uid.is_nil())
+    return nullptr;
+  auto k = UuidKey<score::SettingsDelegateFactory>{uid};
+  for(auto& s : score::GUIAppContext().allSettings())
+  {
+    if(s->concreteKey() == k)
+      return s.get();
+  }
+  return nullptr;
+}
+
+bool JsUtils::fileExists(QString path)
+{
+  return QFileInfo::exists(path);
+}
+bool JsUtils::isFile(QString path)
+{
+  return QFileInfo(path).isFile();
+}
+bool JsUtils::isDir(QString path)
+{
+  return QFileInfo(path).isDir();
+}
+bool JsUtils::canReadFile(QString path)
+{
+  return QFile(path).open(QIODevice::ReadOnly);
+}
+bool JsUtils::canWriteFile(QString path)
+{
+  return QFile(path).open(QIODevice::ReadOnly);
+}
+
+QByteArray JsUtils::readFile(QString path)
+{
+  if(auto doc = score::AppContext().currentDocument())
+    path = score::locateFilePath(path, *doc);
+
+  QFile f(path);
+  if(f.open(QIODevice::ReadOnly))
+    return f.readAll();
+  return {};
+}
+
+void JsUtils::writeFile(QString path, QByteArray content)
+{
+  if(auto doc = score::AppContext().currentDocument())
+    path = score::locateFilePath(path, *doc);
+
+  QFile f(path);
+  if(f.open(QIODevice::WriteOnly))
+    f.write(content);
+}
+
+QStringList JsUtils::listFiles(QString path, QString filters)
+{
+  if(auto doc = score::AppContext().currentDocument())
+    path = score::locateFilePath(path, *doc);
+
+  QDir dir(path);
+  if(!dir.exists())
+    return {};
+
+  QStringList nameFilters;
+  if(!filters.isEmpty())
+    nameFilters = filters.split(';', Qt::SkipEmptyParts);
+
+  QStringList res;
+  const auto entries = dir.entryInfoList(nameFilters, QDir::Files, QDir::Name);
+  res.reserve(entries.size());
+  for(const auto& fi : entries)
+    res.push_back(fi.absoluteFilePath());
+  return res;
+}
+
+QStringList JsUtils::listDirectories(QString path)
+{
+  if(auto doc = score::AppContext().currentDocument())
+    path = score::locateFilePath(path, *doc);
+
+  QDir dir(path);
+  if(!dir.exists())
+    return {};
+
+  QStringList res;
+  const auto entries
+      = dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+  res.reserve(entries.size());
+  for(const auto& fi : entries)
+    res.push_back(fi.absoluteFilePath());
+  return res;
+}
+
+void JsUtils::shell(QString cmd, QJSValue onFinish)
+{
+#if QT_CONFIG(process)
+  const QString sh = "bash";
+
+  QString filename;
+
+  {
+    QTemporaryFile f;
+    f.setAutoRemove(false);
+    if(!f.open())
+      return;
+    filename = f.fileName();
+    f.setPermissions(
+        QFileDevice::WriteOwner | QFileDevice::ReadOwner | QFileDevice::ExeOwner);
+    f.write(cmd.toUtf8());
+    f.close();
+  }
+
+  auto& tp = score::TaskPool::instance();
+  tp.post([onFinish = std::make_shared<QJSValue>(onFinish), filename, sh] {
+    QList<QByteArray> strs;
+    int code{};
+
+    QProcess p;
+    p.setProgram(sh);
+    p.setArguments({"-c", filename});
+    p.start();
+    p.waitForStarted();
+    p.waitForFinished();
+    code = p.exitCode();
+    strs.push_back(p.readAllStandardOutput());
+    strs.push_back(p.readAllStandardError());
+
+    QMetaObject::invokeMethod(qApp, [=] {
+      QFile::remove(filename);
+
+      if(onFinish->isCallable())
+        onFinish->call(
+            QJSValueList() << code << QString::fromUtf8(strs[0])
+                           << QString::fromUtf8(strs[1]));
+    });
+  });
+  //Util.shell("echo toto", (code, stdout, stderr) => { console.log(code, stdout, stderr); })
+#endif
+}
+
+// Async native dialogs. We use the QWidget QFileDialog in non-blocking mode
+// (open() + finished signal) rather than the blocking static helpers, so the
+// Qt Quick render/event loop keeps running while the native picker is shown.
+// The dialog deletes itself on close; the callback always fires (empty path on
+// cancel). Everything here runs on the GUI thread, so the QJSValue can be
+// called back directly without thread marshalling.
+static void runFileDialog(
+    QFileDialog* dialog, std::shared_ptr<QJSValue> onAccept)
+{
+  dialog->setAttribute(Qt::WA_DeleteOnClose);
+  QObject::connect(
+      dialog, &QFileDialog::finished, dialog, [dialog, onAccept](int result) {
+    QString path;
+    if(result == QDialog::Accepted)
+    {
+      const auto files = dialog->selectedFiles();
+      if(!files.isEmpty())
+        path = files.front();
+    }
+    if(onAccept->isCallable())
+      onAccept->call(QJSValueList{} << path);
+  });
+  dialog->open();
+}
+
+void JsUtils::openFileDialog(
+    QString title, QString filters, QString folder, QJSValue onAccept)
+{
+  auto* parent = score::GUIAppContext().mainWindow;
+  auto* dialog = new QFileDialog(parent, title, folder, filters);
+  dialog->setAcceptMode(QFileDialog::AcceptOpen);
+  dialog->setFileMode(QFileDialog::ExistingFile);
+  runFileDialog(dialog, std::make_shared<QJSValue>(std::move(onAccept)));
+}
+
+void JsUtils::saveFileDialog(
+    QString title, QString filters, QString folder, QString defaultName,
+    QJSValue onAccept)
+{
+  auto* parent = score::GUIAppContext().mainWindow;
+  auto* dialog = new QFileDialog(parent, title, folder, filters);
+  dialog->setAcceptMode(QFileDialog::AcceptSave);
+  dialog->setFileMode(QFileDialog::AnyFile);
+  if(!defaultName.isEmpty())
+    dialog->selectFile(defaultName);
+  runFileDialog(dialog, std::make_shared<QJSValue>(std::move(onAccept)));
+}
+
+QString JsUtils::layoutTextLines(QString text, QString font, int pointSize, int maxWidth)
+{
+  if(text.isEmpty())
+    return text;
+  if(ossia::all_of(text, [](const QChar& c) { return c.isLetterOrNumber(); }))
+    return text;
+  if(pointSize <= 0)
+    return text;
+  if(maxWidth <= 0)
+    maxWidth = 0;
+
+  QString cur = text;
+  QFontMetrics m{QFont(font, pointSize)};
+
+  if(m.boundingRect(cur).width() < maxWidth)
+    return cur;
+
+  int last_inserted_linebreak = 0;
+  while(true)
+  {
+    // Go to the last line break
+    int start_search_index = last_inserted_linebreak;
+    int last_line_break = cur.lastIndexOf('\n', last_inserted_linebreak);
+    if(last_line_break != -1)
+    {
+      start_search_index = last_line_break + 1;
+      if(start_search_index >= (cur.size() - 1))
+        break;
+    }
+
+    int min_index_for_break = start_search_index;
+    int last_breakable_char = -1;
+    bool broken = false;
+    // Try to find the most characters that fit in maxWidth
+    for(int j = start_search_index; j < cur.size(); j++)
+    {
+      if(!cur[j].isLetterOrNumber())
+        last_breakable_char = j;
+
+      QString line = cur.mid(start_search_index, j - start_search_index);
+      if(m.boundingRect(line).width() < maxWidth)
+      {
+        min_index_for_break++;
+      }
+      else
+      {
+        // We have to break.
+        if(last_breakable_char == -1)
+        {
+          break; // Go to the "No more characters to break" loop
+        }
+        else
+        {
+          cur.insert(last_breakable_char + 1, '\n');
+          last_inserted_linebreak = last_breakable_char + 1;
+          broken = true;
+          break;
+        }
+      }
+    }
+    if(broken)
+      continue;
+
+    // We're actually good
+    if(m.boundingRect(cur.mid(start_search_index)).width() < maxWidth)
+      break;
+
+    // No more characters to break, we continue until the next one
+    if(last_breakable_char == -1)
+    {
+      for(int j = min_index_for_break; j < cur.size(); j++)
+      {
+        if(!cur[j].isLetterOrNumber())
+        {
+          // Insert a break after it
+          cur.insert(j + 1, '\n');
+          last_inserted_linebreak = j + 1;
+          broken = true;
+          break;
+        }
+      }
+      if(broken)
+        continue;
+
+      // No more characters to break at all, end there
+      break;
+    }
+
+    // To make sure that we eventually terminate:
+    last_inserted_linebreak++;
+    if(last_inserted_linebreak >= cur.size() - 1)
+      break;
+  }
+
+  return cur;
+}
+
+QString JsUtils::uuid()
+{
+  static std::random_device rd;
+  static thread_local rnd::pcg gen{rd};
+
+  union {
+    uint8_t data[16];
+    uint32_t rand[4];
+  } uid;
+  for(int i = 0; i < 4; i++)
+    uid.rand[i] = gen();
+
+  score::uuids::uuid u{uid.data};
+  return score::uuids::toByteArray(u);
+}
+
+QString JsUtils::urlToLocalFile(QString url)
+{
+  return QUrl(url).toLocalFile();
+}
+
+QVariantMap JsUtils::imageSize(QString path)
+{
+  QImageReader reader(path);
+  auto sz = reader.size();
+  return {{"width", sz.width()}, {"height", sz.height()}};
+}
+
+QString JsUtils::environmentVariable(QString name)
+{
+  return qEnvironmentVariable(name.toStdString().c_str());
+}
+
+QTime JsUtils::toTime(TimeVal v)
+{
+  return v.toQTime();
+}
+double JsUtils::toMilliseconds(TimeVal v)
+{
+  return v.msec();
+}
+bool JsUtils::isInfinite(TimeVal v)
+{
+  return v.infinite();
+}
+
+TimeVal JsUtils::timevalFromMilliseconds(double ms)
+{
+  return TimeVal::fromMsecs(ms);
+}
+
+double JsUtils::timestamp() const noexcept
+{
+  using namespace std::chrono;
+  const auto now = steady_clock::now().time_since_epoch();
+  return duration_cast<nanoseconds>(now).count() / 1e9;
+}
+
+bool JsSystem::isDeviceMDMEnrolled()
+{
+  return score::detectSystemEnrolment();
+}
+
+int JsSystem::availableCudaDevice()
+{
+  const auto [major, minor] = score::availableCudaDevice();
+  return 10 * major + minor;
+}
+
+int JsSystem::availableCudaToolkitDylibs(int major, int minor)
+{
+  return score::availableCudaToolkitDylibs(major, minor);
+}
+
+QVariantList JsLibrary::installedPackages()
+{
+  QVariantList res;
+
+#if __has_include(<PackageManager/Model.hpp>)
+  auto& m = score::GUIAppContext().settings<PM::PluginSettingsModel>();
+  for(auto& plug : m.localPlugins.m_vec)
+  {
+    QVariantMap obj;
+    obj["uuid"] = QString::fromUtf8(score::uuids::toByteArray(plug.key.impl()));
+    obj["name"] = plug.name;
+    obj["raw_name"] = plug.raw_name;
+    obj["version"] = plug.version;
+    res.push_back(obj);
+  }
+#endif
+
+  return res;
+}
+
+void JsLibrary::refreshAvailablePackages()
+{
+#if __has_include(<PackageManager/Model.hpp>)
+  auto& m = score::GUIAppContext().settings<PM::PluginSettingsModel>();
+  m.refresh();
+#endif
+}
+
+QVariantList JsLibrary::availablePackages()
+{
+  QVariantList res;
+
+#if __has_include(<PackageManager/Model.hpp>)
+  auto& m = score::GUIAppContext().settings<PM::PluginSettingsModel>();
+  for(auto& plug : m.remotePlugins.m_vec)
+  {
+    QVariantMap obj;
+    obj["uuid"] = QString::fromUtf8(score::uuids::toByteArray(plug.key.impl()));
+    obj["name"] = plug.name;
+    obj["raw_name"] = plug.raw_name;
+    obj["version"] = plug.version;
+    res.push_back(obj);
+  }
+#endif
+
+  return res;
+}
+void JsLibrary::installPackage(const QString& uid)
+{
+#if __has_include(<PackageManager/Model.hpp>)
+  if(uid.length() < 36)
+    return;
+  auto res = UuidKey<PM::Package>::fromString(uid);
+  auto& m = score::GUIAppContext().settings<PM::PluginSettingsModel>();
+  for(const PM::Package& pkg : m.remotePlugins.m_vec)
+  {
+    if(pkg.key.impl() == res.impl())
+    {
+      m.installLibrary(pkg);
+      return;
+    }
+  }
+#endif
+}
+}

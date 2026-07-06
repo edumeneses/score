@@ -1,0 +1,351 @@
+#include "QmlObjects.hpp"
+#include <Process/Process.hpp>
+
+#include <JS/Qml/Metatypes.hpp>
+#if defined(SCORE_HAS_GPU_JS)
+#include <JS/Qml/QmlRhiObjects.hpp>
+#endif
+
+#include <ossia/math/safe_math.hpp>
+
+#include <QVector2D>
+#include <QVector3D>
+#include <QVector4D>
+
+#include <wobjectimpl.h>
+W_OBJECT_IMPL(JS::Inlet)
+W_OBJECT_IMPL(JS::Outlet)
+W_OBJECT_IMPL(JS::ValueInlet)
+W_OBJECT_IMPL(JS::ValueOutlet)
+W_OBJECT_IMPL(JS::ControlInlet)
+W_OBJECT_IMPL(JS::MidiInlet)
+W_OBJECT_IMPL(JS::MidiOutlet)
+W_OBJECT_IMPL(JS::AudioInlet)
+W_OBJECT_IMPL(JS::AudioOutlet)
+
+#if defined(SCORE_HAS_GPU_JS)
+W_OBJECT_IMPL(JS::TextureInlet)
+W_OBJECT_IMPL(JS::TextureOutlet)
+#endif
+
+W_OBJECT_IMPL(JS::Enum)
+W_OBJECT_IMPL(JS::ComboBox)
+W_OBJECT_IMPL(JS::MultiSlider)
+W_OBJECT_IMPL(JS::FileChooser)
+W_OBJECT_IMPL(JS::AudioFileChooser)
+W_OBJECT_IMPL(JS::VideoFileChooser)
+W_OBJECT_IMPL(JS::Toggle)
+W_OBJECT_IMPL(JS::HSVSlider)
+W_OBJECT_IMPL(JS::Button)
+W_OBJECT_IMPL(JS::Impulse)
+W_OBJECT_IMPL(JS::LineEdit)
+
+W_GADGET_IMPL(JS::InValueMessage)
+W_GADGET_IMPL(JS::OutValueMessage)
+W_GADGET_IMPL(JS::MidiMessage)
+
+auto disregard_me = &JS::InValueMessage::staticMetaObject;
+auto disregard_me_1 = &JS::OutValueMessage::staticMetaObject;
+auto disregard_me_2 = &JS::MidiMessage::staticMetaObject;
+namespace JS
+{
+
+ValueInlet::ValueInlet(QObject* parent)
+    : Inlet{parent}
+{
+}
+
+ValueInlet::~ValueInlet() { }
+
+int ValueInlet::length() const noexcept
+{
+  switch(this->m_value.typeId())
+  {
+    case QMetaType::QVector2D:
+      return 2;
+    case QMetaType::QVector3D:
+      return 3;
+    case QMetaType::QVector4D:
+      return 4;
+    case QMetaType::QVariantList: {
+      const auto& lst = this->m_value.value<QVariantList>();
+      return lst.size();
+    }
+    default: {
+      if(this->m_value.canConvert<QVariantList>())
+      {
+        const auto& lst = this->m_value.value<QVariantList>();
+        return lst.size();
+      }
+      break;
+    }
+  }
+  return 0;
+}
+
+QVariant ValueInlet::at(int index) const noexcept
+{
+  switch(this->m_value.typeId())
+  {
+    case QMetaType::QVector2D: {
+      if(index == 0)
+        return this->m_value.value<QVector2D>().x();
+      else if(index == 1)
+        return this->m_value.value<QVector2D>().y();
+      break;
+    }
+    case QMetaType::QVector3D: {
+      if(index == 0)
+        return this->m_value.value<QVector3D>().x();
+      else if(index == 1)
+        return this->m_value.value<QVector3D>().y();
+      else if(index == 2)
+        return this->m_value.value<QVector3D>().z();
+      break;
+    }
+    case QMetaType::QVector4D: {
+      if(index == 0)
+        return this->m_value.value<QVector4D>().x();
+      else if(index == 1)
+        return this->m_value.value<QVector4D>().y();
+      else if(index == 2)
+        return this->m_value.value<QVector4D>().z();
+      else if(index == 3)
+        return this->m_value.value<QVector4D>().w();
+      break;
+    }
+    case QMetaType::QVariantList: {
+      const auto& lst = this->m_value.value<QVariantList>();
+      if(index >= 0 && index < lst.size())
+        return lst[index];
+      break;
+    }
+    default: {
+      if(this->m_value.canConvert<QVariantList>())
+      {
+        const auto& lst = this->m_value.value<QVariantList>();
+        if(index >= 0 && index < lst.size())
+          return lst[index];
+      }
+      break;
+    }
+  }
+  return {};
+}
+
+QVariant ValueInlet::value() const
+{
+  return m_value;
+}
+
+void ValueInlet::setValue(QVariant value)
+{
+  if(m_value == value)
+    return;
+
+  m_value = std::move(value);
+  valueChanged(m_value);
+}
+
+ControlInlet::ControlInlet(QObject* parent)
+    : Inlet{parent}
+{
+}
+
+ControlInlet::~ControlInlet() { }
+
+QVariant ControlInlet::value() const noexcept
+{
+  return m_value;
+}
+
+void ControlInlet::setValue(QVariant value)
+{
+  if(m_value == value)
+    return;
+
+  m_value = std::move(value);
+  valueChanged(m_value);
+}
+
+ValueOutlet::ValueOutlet(QObject* parent)
+    : Outlet{parent}
+{
+}
+
+ValueOutlet::~ValueOutlet() { }
+
+const QJSValue& ValueOutlet::value() const
+{
+  return m_value;
+}
+
+void ValueOutlet::setValue(const QJSValue& value)
+{
+  m_value = value;
+}
+
+void ValueOutlet::addValue(qreal timestamp, QJSValue t)
+{
+  values.push_back({timestamp, std::move(t)});
+}
+
+AudioInlet::AudioInlet(QObject* parent)
+    : Inlet{parent}
+{
+}
+
+AudioInlet::~AudioInlet() { }
+
+QVector<QVector<double>>& AudioInlet::audio()
+{
+  return m_audio;
+}
+const QVector<QVector<double>>& AudioInlet::audio() const
+{
+  return m_audio;
+}
+
+void AudioInlet::setAudio(const QVector<QVector<double>>& audio)
+{
+  m_audio = audio;
+}
+
+void AudioInlet::setAudio(QVector<QVector<double>>&& audio)
+{
+  m_audio = std::move(audio);
+}
+
+AudioOutlet::AudioOutlet(QObject* parent)
+    : Outlet{parent}
+{
+}
+
+AudioOutlet::~AudioOutlet() { }
+
+const QVector<QVector<double>>& AudioOutlet::audio() const
+{
+  return m_audio;
+}
+
+#if defined(SCORE_HAS_GPU_JS)
+TextureInlet::TextureInlet(QObject* parent)
+    : Inlet{parent}
+#if __has_include(<QQuickRhiItem>)
+    , m_item{new TextureInletItem{}}
+#else
+    , m_item{new QQuickItem{}}
+#endif
+{
+}
+
+TextureInlet::~TextureInlet() { }
+TextureOutlet::TextureOutlet(QObject* parent)
+    : Outlet{parent}
+{
+}
+
+TextureOutlet::~TextureOutlet() { }
+#endif
+
+MidiInlet::MidiInlet(QObject* parent)
+    : Inlet{parent}
+{
+}
+
+MidiInlet::~MidiInlet() { }
+
+MidiOutlet::MidiOutlet(QObject* parent)
+    : Outlet{parent}
+{
+}
+
+MidiOutlet::~MidiOutlet() { }
+
+void MidiOutlet::clear()
+{
+  m_midi.clear();
+}
+
+const QVector<QVector<int>>& MidiOutlet::midi() const
+{
+  return m_midi;
+}
+
+void AudioOutlet::setChannel(int i, const QJSValue& v)
+{
+  if(i < 0)
+    i = 0;
+  if(i + 1 > std::ssize(m_audio))
+    m_audio.resize(i + 1);
+
+  int n = v.property("length").toNumber();
+  auto& arr = m_audio[i];
+  arr.clear();
+  arr.resize(n);
+  double* data = arr.data();
+  for(int s = 0; s < n; s++)
+  {
+    if(const auto& prop = v.property(s); prop.isNumber())
+    {
+      data[s] = prop.toNumber();
+      if(ossia::safe_isinf(data[s]) || ossia::safe_isnan(data[s]))
+        data[s] = 0.;
+    }
+    else
+    {
+      data[s] = 0.;
+    }
+  }
+}
+
+Process::Inlet* ScriptUI::inlet(int i) const noexcept
+{
+  if(!m_process)
+    return nullptr;
+  if(i < 0 || i >= m_process->inlets().size())
+    return nullptr;
+  return m_process->inlets()[i];
+}
+
+Process::Outlet* ScriptUI::outlet(int i) const noexcept
+{
+  if(!m_process)
+    return nullptr;
+  if(i < 0 || i >= m_process->outlets().size())
+    return nullptr;
+  return m_process->outlets()[i];
+}
+
+Process::Inlet* ScriptUI::inlet(const QString& i) const noexcept
+{
+  if(!m_process)
+    return nullptr;
+  for(auto* p : m_process->inlets()) {
+    if(p->name() == i)
+      return p;
+  }
+  return nullptr;
+}
+
+Process::Outlet* ScriptUI::outlet(const QString& i) const noexcept
+{
+  if(!m_process)
+    return nullptr;
+  for(auto* p : m_process->outlets()) {
+    if(p->name() == i)
+      return p;
+  }
+  return nullptr;
+}
+Inlet::~Inlet() { }
+Outlet::~Outlet() { }
+
+Toggle::~Toggle() = default;
+Button::~Button() = default;
+Impulse::~Impulse() = default;
+Enum::~Enum() = default;
+ComboBox::~ComboBox() = default;
+LineEdit::~LineEdit() = default;
+HSVSlider::~HSVSlider() = default;
+}

@@ -1,0 +1,321 @@
+#include <score/tools/RecursiveWatch.hpp>
+#include <score/tools/ThreadPool.hpp>
+
+#include <QCoreApplication>
+#include <QMetaObject>
+#include <QPointer>
+#include <Qt>
+
+#include <cstddef>
+#include <iostream>
+
+#if __has_include(<version>)
+#include <version>
+#endif
+
+// https://github.com/ned14/llfio/issues/144
+#if __has_include(<llfio.hpp>) && !defined(__EMSCRIPTEN__)
+#define SCORE_HAS_LLFIO 1
+#elif defined(__APPLE__)
+#if __MAC_OS_X_VERSION_MIN_REQUIRED >= __MAC_10_15
+#if __cpp_lib_filesystem >= 201703
+#define SCORE_HAS_STD_FILESYSTEM 1
+#endif
+#endif
+#else
+#if __cpp_lib_filesystem >= 201703
+#define SCORE_HAS_STD_FILESYSTEM 1
+#endif
+#endif
+
+#if SCORE_HAS_LLFIO
+#define LLFIO_HEADERS_ONLY 1
+//#define LLFIO_EXPERIMENTAL_STATUS_CODE 1
+#define LLFIO_DISABLE_OPENSSL 1
+#define QUICKCPPLIB_USE_STD_SPAN 1
+// #define OUTCOME_USE_SYSTEM_STATUS_CODE 0
+
+#if defined(__MINGW32__)
+#define LLFIO_DISABLE_SIGNAL_GUARD 1
+#endif
+
+#if !defined(__has_feature)
+#define __has_feature(T) 0
+#endif
+#if !defined(__has_extension)
+#define __has_extension(T) 0
+#endif
+
+#include <llfio.hpp>
+#elif SCORE_HAS_STD_FILESYSTEM
+#include <filesystem>
+#elif __has_include(<fts.h>)
+#include <fts.h>
+
+#include <cstring>
+#define SCORE_HAS_FTS 1
+#else
+#error Platform missing a simple way to iterate directories.
+#endif
+
+namespace score
+{
+#if SCORE_HAS_LLFIO
+void for_all_files(std::string_view root, std::function<void(std::string_view)> f)
+{
+  using namespace LLFIO_V2_NAMESPACE;
+  auto pp = path_handle::path(path_view(root, path_view::zero_terminated));
+  algorithm::contents_visitor vis;
+  vis.contents_include_symlinks = true;
+  try
+  {
+    if(auto res = algorithm::contents(pp.value()))
+    {
+      for(auto& p : res.value())
+      {
+        switch(p.second.st_type)
+        {
+#if !defined(_WIN32)
+          case std::filesystem::file_type::symlink:
+            for_all_files(p.first.native(), f);
+            break;
+#endif
+          case std::filesystem::file_type::regular: {
+            std::filesystem::path r{root};
+            r /= p.first;
+
+#if !defined(_WIN32)
+            f(r.native());
+#else
+            f(r.generic_string());
+#endif
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+  }
+  catch(...)
+  {
+  }
+}
+#endif
+
+#if SCORE_HAS_STD_FILESYSTEM
+void for_all_files(std::string_view root, std::function<void(std::string_view)> f)
+try
+{
+  namespace fs = std::filesystem;
+  using iterator = fs::recursive_directory_iterator;
+#if defined(_WIN32)
+  constexpr auto options = fs::directory_options::skip_permission_denied;
+#else
+  constexpr auto options = fs::directory_options::follow_directory_symlink
+                           | fs::directory_options::skip_permission_denied;
+#endif
+  for(auto it = iterator{root, options}, end = iterator{}; it != end; ++it)
+  {
+    try
+    {
+      const auto& path = it->path();
+#if defined(_WIN32)
+      std::string path_str = path.generic_string();
+#else
+      std::string_view path_str = path.native();
+#endif
+      if(path_str.empty())
+        continue;
+      auto last_slash = path_str.find_last_of('/');
+      if(last_slash == path_str.npos || last_slash == path_str.length() - 1)
+        continue;
+      if(path_str[last_slash + 1] == '.')
+      {
+        it.disable_recursion_pending();
+        continue;
+      }
+
+      f(path_str);
+    }
+    catch(...)
+    {
+      continue;
+    }
+  }
+}
+catch(...)
+{
+}
+#elif SCORE_HAS_FTS
+static void
+process_file(FTS* fts, FTSENT* curr, std::function<void(std::string_view)>& f)
+{
+  switch(curr->fts_info)
+  {
+    case FTS_NS:
+    case FTS_DNR:
+    case FTS_ERR:
+      std::cerr << "for_all_files: " << curr->fts_accpath << ":"
+                << strerror(curr->fts_errno) << std::endl;
+      break;
+
+    case FTS_DC:
+    case FTS_DOT:
+      break;
+
+    // Skip unwanted folders (.git, etc)
+    case FTS_D: {
+      if(curr->fts_name[0] == '.')
+      {
+        fts_set(fts, curr, FTS_SKIP);
+      }
+
+      break;
+    }
+
+    // Process our file
+    case FTS_NSOK:
+    case FTS_F: {
+      f(curr->fts_path);
+      break;
+    }
+    case FTS_DP:
+    case FTS_SL:
+    case FTS_SLNONE:
+    case FTS_DEFAULT:
+      break;
+  }
+}
+
+void for_all_files(std::string_view root, std::function<void(std::string_view)> f)
+{
+  char* files[] = {(char*)root.data(), nullptr};
+  auto fts = fts_open(files, FTS_NOCHDIR | FTS_LOGICAL | FTS_NOSTAT, nullptr);
+  if(!fts)
+  {
+    return;
+  }
+
+  while(auto curr = fts_read(fts))
+  {
+    process_file(fts, curr, f);
+  }
+
+  fts_close(fts);
+}
+#endif
+
+}
+
+namespace score
+{
+namespace
+{
+// Mitigation for same bug as https://github.com/microsoft/STL/issues/165
+struct AsyncScanState
+{
+  using Map = ossia::string_map<std::vector<RecursiveWatch::AsyncCallbacks>>;
+
+  Map watched;
+  std::string root;
+  QPointer<QObject> ctx;
+
+  AsyncScanState(Map&& w, std::string r, QObject* c)
+      : watched{std::move(w)}
+      , root{std::move(r)}
+      , ctx{c}
+  {
+  }
+
+  AsyncScanState(AsyncScanState&& other) noexcept
+      : watched{std::move(other.watched)}
+      , root{std::move(other.root)}
+      , ctx{std::move(other.ctx)}
+  {
+  }
+
+  AsyncScanState(const AsyncScanState&) = delete;
+  AsyncScanState& operator=(AsyncScanState&&) = delete;
+  AsyncScanState& operator=(const AsyncScanState&) = delete;
+};
+}
+
+void RecursiveWatch::scan() const
+{
+#if !defined(SCORE_DEPLOYMENT_BUILD)
+  static const bool disable_library = qEnvironmentVariableIsSet("SCORE_DISABLE_LIBRARY");
+  if(Q_UNLIKELY(disable_library))
+    return;
+#endif
+
+  for_all_files(m_root, [this](std::string_view path) {
+    if(path.empty())
+      return;
+    if(auto last_dot = path.find_last_of('.'); last_dot < path.size() - 1)
+    {
+      std::string_view suffix = path.substr(last_dot + 1);
+      if(auto it = m_watched.find(suffix); it != m_watched.end())
+      {
+        for(auto& handler : it->second)
+        {
+          handler.added(path);
+        }
+      }
+    }
+  });
+}
+
+void RecursiveWatch::scanAsync(QObject* context)
+{
+#if !defined(SCORE_DEPLOYMENT_BUILD)
+  static const bool disable_library = qEnvironmentVariableIsSet("SCORE_DISABLE_LIBRARY");
+  if(Q_UNLIKELY(disable_library))
+    return;
+#endif
+
+  // Note that callers should always set a new set of watched things
+  // before calling scanAsync.
+  score::TaskPool::instance().post(
+      [state = AsyncScanState{std::move(m_asyncWatched), m_root, context}] {
+    std::vector<std::function<void()>> actions;
+
+    auto send_to_main_thread = [pctx = state.ctx, &actions] {
+      // Batch-deliver all commit actions to the GUI thread
+      QMetaObject::invokeMethod(
+          QCoreApplication::instance(), [pctx = pctx, actions = std::move(actions)] {
+        if(!pctx)
+          return;
+        for(auto& action : actions)
+          action();
+      }, Qt::QueuedConnection);
+
+      actions.clear();
+    };
+
+    for_all_files(state.root, [&](std::string_view path) {
+      if(path.empty())
+        return;
+      auto last_dot = path.find_last_of('.');
+      if(last_dot >= path.size() - 1)
+        return;
+
+      std::string_view suffix = path.substr(last_dot + 1);
+      auto it = state.watched.find(suffix);
+      if(it == state.watched.end())
+        return;
+      for(auto& handler : it->second)
+      {
+        if(auto action = handler.filter(path))
+        {
+          actions.push_back(std::move(action));
+          if(actions.size() >= 255)
+            send_to_main_thread();
+        }
+      }
+    });
+
+    send_to_main_thread();
+  });
+}
+}

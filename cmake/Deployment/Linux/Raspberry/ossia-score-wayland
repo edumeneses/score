@@ -1,0 +1,18 @@
+#!/bin/bash -eux
+
+# Default script to use to launch ossia on a graphical session under a Pi
+DIR=$(realpath "${BASH_SOURCE[0]}")
+DIR=$(dirname "$DIR")
+
+source "$DIR/setup-dependencies.sh"
+
+if [[ -n MESA_GLES_VERSION_OVERRIDE ]]; then
+  export MESA_GLES_VERSION_OVERRIDE=3.2
+fi
+if [[ -n MESA_GLSL_VERSION_OVERRIDE ]]; then
+  export MESA_GLSL_VERSION_OVERRIDE=320
+fi
+
+export QT_QPA_PLATFORM=wayland
+
+"$DIR/ossia-score" $@

@@ -1,0 +1,50 @@
+#pragma once
+#include <score/model/Identifier.hpp>
+#include <score/serialization/VisitorInterface.hpp>
+
+#include <score_lib_base_export.h>
+
+class QWidget;
+namespace score
+{
+class Document;
+class DocumentBackupManager;
+class DocumentDelegateFactory;
+class DocumentModel;
+struct GUIApplicationContext;
+struct RestorableDocument;
+
+/**
+ * @brief Methods to set-up documents.
+ *
+ * Facility to construct a Document according to different cases :
+ * - Creating a blank, new document.
+ * - Loading a document.
+ * - Restoring a document after a crash.
+ *
+ */
+class SCORE_LIB_BASE_EXPORT DocumentBuilder
+{
+public:
+  explicit DocumentBuilder(QObject* parentPresenter, QWidget* parentView);
+
+  Document* newDocument(
+      const score::GUIApplicationContext& ctx, const Id<DocumentModel>& id,
+      score::DocumentDelegateFactory& doctype);
+  Document* loadDocument(
+      const score::GUIApplicationContext& ctx, QString filename,
+      score::DocumentDelegateFactory& doctype);
+  Document* loadDocument(
+      const score::GUIApplicationContext& ctx, QString filename, QByteArray data,
+      SerializationIdentifier format, score::DocumentDelegateFactory& doctype);
+  Document* restoreDocument(
+      const score::GUIApplicationContext& ctx, const score::RestorableDocument& doc,
+      score::DocumentDelegateFactory& doctype);
+
+private:
+  void setBackupManager(Document* doc);
+
+  QObject* m_parentPresenter{};
+  QWidget* m_parentView{};
+};
+}

@@ -1,0 +1,27 @@
+#!/bin/bash -eux
+
+# This script will run ossia score directly on DRM & EGLFS,
+# without using X11, Wayland or anything like this.
+# This is almost most efficient way to playback scores that use the GPU on a Pi
+# as the entirety of the GPU is dedicated to the graphics rendering of score.
+# (The most efficient is through the Vulkan vkkhrdisplay backend which gives a small additional edge).
+# Note that the Qt EGLFS back-end is fairly configurable: if multiple screens
+# or special resolution is required, check out the documentation here:
+# https://doc.qt.io/qt-6/embedded-linux.html
+# in particular "Custom configuration" near the end
+DIR=$(realpath "${BASH_SOURCE[0]}")
+DIR=$(dirname "$DIR")
+
+source "$DIR/setup-dependencies.sh"
+
+if [[ -n MESA_GLES_VERSION_OVERRIDE ]]; then
+  export MESA_GLES_VERSION_OVERRIDE=3.2
+fi
+if [[ -n MESA_GLSL_VERSION_OVERRIDE ]]; then
+  export MESA_GLSL_VERSION_OVERRIDE=320
+fi
+
+export QT_QPA_PLATFORM=eglfs
+export QSG_RHI_BACKEND=opengl
+
+"$DIR/ossia-score" $@ --no-opengl

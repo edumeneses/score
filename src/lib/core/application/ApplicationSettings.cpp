@@ -1,0 +1,213 @@
+// This is an open source non-commercial project. Dear PVS-Studio, please check
+// it. PVS-Studio Static Code Analyzer for C, C++ and C#: http://www.viva64.com
+#include "ApplicationSettings.hpp"
+
+#include <QApplication>
+#include <QCommandLineOption>
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QFile>
+#include <QFileInfo>
+#include <QObject>
+#include <QString>
+
+#include <score_git_info.hpp>
+
+#include <thread>
+namespace score
+{
+void ApplicationSettings::parse(QStringList cargs, int& argc, char** argv)
+{
+  arguments = cargs;
+
+  opengl = false;
+  QCommandLineParser parser;
+  parser.setApplicationDescription(
+      QObject::tr("score - An interactive sequencer for the intermedia arts."));
+  parser.addHelpOption();
+  parser.addVersionOption();
+  parser.addPositionalArgument(
+      "file", QCoreApplication::translate("main", "Scenario to load."));
+
+  QCommandLineOption noGUI("no-gui", QCoreApplication::translate("main", "Disable GUI"));
+  parser.addOption(noGUI);
+
+  QCommandLineOption noGL(
+      "no-opengl", QCoreApplication::translate("main", "Disable OpenGL rendering"));
+  parser.addOption(noGL);
+
+  QCommandLineOption GL(
+      "opengl", QCoreApplication::translate("main", "Enable OpenGL rendering"));
+  parser.addOption(GL);
+
+  QCommandLineOption noRestore(
+      "no-restore", QCoreApplication::translate("main", "Disable auto-restore"));
+  parser.addOption(noRestore);
+
+  QCommandLineOption forceRestore(
+      "force-restore", QCoreApplication::translate("main", "Force auto-restore"));
+  parser.addOption(forceRestore);
+
+  QCommandLineOption autoplayOpt(
+      "autoplay", QCoreApplication::translate("main", "Auto-play the loaded scenario"));
+  parser.addOption(autoplayOpt);
+
+  QCommandLineOption vectorguiOpt(
+      "vector-gui",
+      QCoreApplication::translate(
+          "main",
+          "GUI will use vector rendering whenever possible. Slower but prettier."));
+  parser.addOption(vectorguiOpt);
+
+  QCommandLineOption no_vectorguiOpt(
+      "no-vector-gui",
+      QCoreApplication::translate(
+          "main",
+          "GUI will use pre-rendered pixmaps whenever possible. Faster but "
+          "looks pixelated when zooming."));
+  parser.addOption(no_vectorguiOpt);
+
+  QCommandLineOption waitLoadOpt(
+      "wait",
+      QCoreApplication::translate(
+          "main", "Wait N seconds after loading, before playing."),
+      "N", "0");
+  parser.addOption(waitLoadOpt);
+
+  QCommandLineOption uiOpt(
+      "ui", QCoreApplication::translate("main", "Specify an UI file to load."), "file",
+      "");
+  parser.addOption(uiOpt);
+
+  QCommandLineOption uiOptDebug(
+      "ui-debug",
+      QCoreApplication::translate(
+          "main", "Specify an UI file to load (debug mode, opens the score UI)."),
+      "file", "");
+  parser.addOption(uiOptDebug);
+
+#if defined(__APPLE__)
+  // Bogus macOS gatekeeper BS:
+  // https://stackoverflow.com/questions/55562155/qt-application-for-mac-not-being-launched
+  for(auto it = cargs.begin(); it != cargs.end();)
+  {
+    auto& str = *it;
+    if(str.startsWith("-psn"))
+    {
+      it = cargs.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+#endif
+
+  if(cargs.contains("--help") || cargs.contains("--version"))
+  {
+    QCoreApplication app(argc, argv);
+    setQApplicationMetadata();
+    parser.process(cargs);
+    exit(0);
+  }
+  else
+  {
+    parser.parse(cargs);
+  }
+
+  // Remove all the positional arguments that aren't files
+  // otherwise we get ./ossia-score foo.score -platform vnc
+  // => {"foo.score", "vnc"}...
+  QStringList args = parser.positionalArguments();
+  for(auto it = args.begin(); it != args.end();)
+  {
+    if(QFile::exists(*it))
+    {
+      *it = QFileInfo{*it}.canonicalFilePath();
+      ++it;
+    }
+    else
+    {
+      it = args.erase(it);
+    }
+  }
+
+  tryToRestore = !parser.isSet(noRestore);
+  this->forceRestore = parser.isSet(forceRestore);
+  gui = !parser.isSet(noGUI);
+
+  if(parser.isSet(uiOpt))
+  {
+    gui = false;
+    ui = parser.value(uiOpt);
+    tryToRestore = false;
+  }
+  else if(parser.isSet(uiOptDebug))
+  {
+    gui = true;
+    ui = parser.value(uiOptDebug);
+  }
+
+  if(parser.isSet(GL))
+    opengl = true;
+  if(parser.isSet(noGL))
+    opengl = false;
+
+  vector_gui = std::thread::hardware_concurrency() > 4;
+  if(parser.isSet(vectorguiOpt))
+    vector_gui = true;
+  if(parser.isSet(no_vectorguiOpt))
+    vector_gui = false;
+
+  if(!gui)
+    tryToRestore = false;
+  autoplay = parser.isSet(autoplayOpt);
+
+  if(parser.isSet(waitLoadOpt))
+    waitAfterLoad = parser.value(waitLoadOpt).toInt();
+
+  if(!args.empty() && QFile::exists(args[0]))
+  {
+    loadList.push_back(args[0]);
+  }
+}
+
+void setQApplicationMetadata()
+{
+  if(auto env = qEnvironmentVariable("SCORE_CUSTOM_APP_ORGANIZATION_NAME"); !env.isEmpty())
+    QCoreApplication::setOrganizationName(env);
+  else
+    QCoreApplication::setOrganizationName("ossia");
+
+  if(auto env = qEnvironmentVariable("SCORE_CUSTOM_APP_ORGANIZATION_DOMAIN"); !env.isEmpty())
+    QCoreApplication::setOrganizationDomain(env);
+  else
+    QCoreApplication::setOrganizationDomain("ossia.io");
+
+  if(auto env = qEnvironmentVariable("SCORE_CUSTOM_APP_APPLICATION_NAME"); !env.isEmpty())
+    QCoreApplication::setApplicationName(env);
+  else
+    QCoreApplication::setApplicationName("score");
+
+  if(auto env = qEnvironmentVariable("SCORE_CUSTOM_APP_APPLICATION_VERSION"); !env.isEmpty())
+    QCoreApplication::setApplicationVersion(env);
+  else
+  {
+    if(QString(SCORE_VERSION_EXTRA).isEmpty())
+    {
+      QCoreApplication::setApplicationVersion(QString("%1.%2.%3")
+                                                  .arg(SCORE_VERSION_MAJOR)
+                                                  .arg(SCORE_VERSION_MINOR)
+                                                  .arg(SCORE_VERSION_PATCH));
+    }
+    else
+    {
+      QCoreApplication::setApplicationVersion(QString("%1.%2.%3-%4")
+                                                  .arg(SCORE_VERSION_MAJOR)
+                                                  .arg(SCORE_VERSION_MINOR)
+                                                  .arg(SCORE_VERSION_PATCH)
+                                                  .arg(SCORE_VERSION_EXTRA));
+    }
+  }
+}
+}

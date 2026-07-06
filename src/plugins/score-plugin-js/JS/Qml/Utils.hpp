@@ -1,0 +1,123 @@
+#pragma once
+#include <Process/TimeValue.hpp>
+
+#include <JS/Qml/QmlObjects.hpp>
+
+#include <QJSValue>
+#include <QObject>
+#include <QProcess>
+#include <QString>
+#include <QTime>
+
+#include <verdigris>
+namespace JS
+{
+class JsUtils : public QObject
+{
+  W_OBJECT(JsUtils)
+public:
+  bool fileExists(QString path);
+  W_SLOT(fileExists)
+  bool isFile(QString path);
+  W_SLOT(isFile)
+  bool isDir(QString path);
+  W_SLOT(isDir)
+  bool canReadFile(QString path);
+  W_SLOT(canReadFile)
+  bool canWriteFile(QString path);
+  W_SLOT(canWriteFile)
+
+  QByteArray readFile(QString path);
+  W_SLOT(readFile)
+  void writeFile(QString path, QByteArray content);
+  W_SLOT(writeFile)
+
+  // Absolute paths of the files in a directory matching the given glob filters
+  // (e.g. "*.scp" or "*.scp;*.json"; empty = all files). Empty if the directory
+  // does not exist. <LIBRARY>:/<PROJECT>: paths are resolved like readFile.
+  QStringList listFiles(QString path, QString filters);
+  W_SLOT(listFiles)
+  // Absolute paths of the immediate sub-directories of a directory.
+  QStringList listDirectories(QString path);
+  W_SLOT(listDirectories)
+
+  void shell(QString cmd, QJSValue onFinish);
+  W_SLOT(shell)
+
+  // Native, asynchronous file dialogs usable from any Qt Quick app.
+  // onAccept is a JS callback invoked with the chosen path (empty string if
+  // the dialog was cancelled). The dialog never blocks the QML thread.
+  void openFileDialog(QString title, QString filters, QString folder, QJSValue onAccept);
+  W_SLOT(openFileDialog)
+  void saveFileDialog(
+      QString title, QString filters, QString folder, QString defaultName,
+      QJSValue onAccept);
+  W_SLOT(saveFileDialog)
+
+  QString layoutTextLines(QString text, QString font, int pointSize, int maxWidth);
+  W_SLOT(layoutTextLines)
+
+  QString uuid();
+  W_SLOT(uuid)
+
+  QString urlToLocalFile(QString url);
+  W_SLOT(urlToLocalFile)
+
+  QVariantMap imageSize(QString path);
+  W_SLOT(imageSize)
+
+  QString environmentVariable(QString name);
+  W_SLOT(environmentVariable)
+
+  QTime toTime(TimeVal v);
+  W_SLOT(toTime)
+  double toMilliseconds(TimeVal v);
+  W_SLOT(toMilliseconds)
+  bool isInfinite(TimeVal v);
+  W_SLOT(isInfinite)
+
+  TimeVal timevalFromMilliseconds(double ms);
+  W_SLOT(timevalFromMilliseconds)
+
+  QObject* settings(QString uid);
+  W_INVOKABLE(settings);
+
+  // In seconds
+  double timestamp() const noexcept;
+  W_INVOKABLE(timestamp)
+};
+
+class JsSystem : public QObject
+{
+  W_OBJECT(JsSystem)
+public:
+  bool isDeviceMDMEnrolled();
+  W_SLOT(isDeviceMDMEnrolled)
+
+  int availableCudaDevice();
+  W_SLOT(availableCudaDevice)
+
+  int availableCudaToolkitDylibs(int major, int minor);
+  W_SLOT(availableCudaToolkitDylibs)
+};
+
+class JsLibrary : public QObject
+{
+  W_OBJECT(JsLibrary)
+public:
+  // On this machine
+  QVariantList installedPackages();
+  W_SLOT(installedPackages)
+
+  // On the server
+  void refreshAvailablePackages();
+  W_SLOT(refreshAvailablePackages)
+
+  QVariantList availablePackages();
+  W_SLOT(availablePackages)
+
+  // From the server to this machine
+  void installPackage(const QString& uid);
+  W_SLOT(installPackage)
+};
+}

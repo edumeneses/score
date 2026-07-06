@@ -1,0 +1,97 @@
+#include <Gfx/GfxExecContext.hpp>
+
+#include <ossia/dataflow/audio_port.hpp>
+#include <ossia/detail/algorithms.hpp>
+namespace Gfx
+{
+
+GfxExecutionAction::GfxExecutionAction(GfxContext& w)
+    : ui{&w}
+{
+  prev_edges.reserve(100);
+  edges_cache.reserve(100);
+
+  // Fixme: do the same for audio & geometry buffers
+  for(int i = 0; i < 500; i++)
+  {
+    std::vector<score::gfx::gfx_input> mbuf;
+    mbuf.reserve(128);
+    ui->m_buffers.release(std::move(mbuf));
+  }
+}
+
+struct clear_msg_visitor
+{
+  void operator()(const auto& whatever) { }
+  void operator()(ossia::audio_vector& vec)
+  {
+    while(!vec.empty())
+    {
+      ossia::audio_buffer_pool::instance().release(std::move(vec.back()));
+      vec.pop_back();
+    }
+  }
+};
+score::gfx::Message GfxExecutionAction::allocateMessage(int inputs)
+{
+  score::gfx::Message m{
+      .node_id = {},
+      .token = {},
+      .input = ui->m_buffers.acquire(),
+  };
+
+  for(auto& in : m.input)
+  {
+    visit(clear_msg_visitor{}, in);
+  }
+
+  m.input.clear();
+  m.input.reserve(inputs);
+  return m;
+}
+
+void GfxExecutionAction::releaseMessage(score::gfx::Message&& m)
+{
+  if(m.input.capacity() > 0)
+  {
+    ui->m_buffers.release(std::move(m.input));
+  }
+}
+
+void GfxExecutionAction::startTick(const ossia::audio_tick_state& st) { }
+
+void GfxExecutionAction::setEdge(
+    port_index source, port_index sink, Process::CableType t)
+{
+  incoming_edges.enqueue({source, sink, t});
+}
+
+void GfxExecutionAction::endTick(const ossia::audio_tick_state& st)
+{
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+
+  edges_cache.clear();
+  edges_cache.reserve(std::max(prev_edges.size(), incoming_edges.size_approx()));
+
+  EdgeSpec e;
+  while(incoming_edges.try_dequeue(e))
+  {
+    edges_cache.push_back(e);
+  }
+  if(edges_cache != prev_edges)
+  {
+    ossia::remove_duplicates(edges_cache);
+    if(edges_cache != prev_edges)
+    {
+      {
+        std::lock_guard l{ui->edges_lock};
+
+        ui->new_edges.tree().get_sequence_ref().assign(edges_cache.begin(), edges_cache.end());
+      }
+
+      std::swap(edges_cache, prev_edges);
+      ui->edges_changed = true;
+    }
+  }
+}
+}

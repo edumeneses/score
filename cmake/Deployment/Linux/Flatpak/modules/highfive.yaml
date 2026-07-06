@@ -1,0 +1,16 @@
+# highfive
+name: highfive
+buildsystem: cmake-ninja
+builddir: true
+config-opts:
+  - -Wno-dev
+  - -DHIGHFIVE_EXAMPLES=0
+  - -DHIGHFIVE_UNIT_TESTS=0
+  - -DHIGHFIVE_BUILD_DOCS=0
+  - -DHIGHFIVE_FIND_HDF5=1
+  - -DHIGHFIVE_USE_BOOST=0
+
+sources:
+  - type: archive
+    url: https://github.com/highfive-devs/highfive/archive/refs/tags/v3.3.0.tar.gz
+    sha256: 325cfbcf0c0296a6dd26f3b088801b7ebb8d6f109c0565c11d2d8c4af3253bff

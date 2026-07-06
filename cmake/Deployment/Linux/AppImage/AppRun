@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# Resolve app package path
+SCORE_CONF_FILE="$HOME/.config/ossia/score.conf"
+
+if [[ -f "$SCORE_CONF_FILE" ]]; then
+    # Extract RootPath from the [Library] section
+    SCORE_LIBRARY_ROOT_PATH=$(sed -n '/^\[Library\]/,/^\[/{s/^RootPath=//p}' "$SCORE_CONF_FILE")
+fi
+
+# Fall back to default if conf doesn't exist or RootPath wasn't found
+if [[ -z "$SCORE_LIBRARY_ROOT_PATH" ]]; then
+    SCORE_LIBRARY_ROOT_PATH="$HOME/Documents/ossia/score"
+fi
+
+# Expand ~ if present (in case the conf file contains a literal ~)
+SCORE_LIBRARY_ROOT_PATH="${SCORE_LIBRARY_ROOT_PATH/#\~/$HOME}"
+
+# Build LD_LIBRARY_PATH from subfolders containing shared libs
+SCORE_SUPPORT_DIR="$SCORE_LIBRARY_ROOT_PATH/support"
+
+if [[ -d "$SCORE_SUPPORT_DIR" ]]; then
+    while IFS= read -r -d '' dir; do
+        # Check if this directory directly contains any .so files
+        if compgen -G "$dir"/*.so > /dev/null 2>&1 || \
+           compgen -G "$dir"/*.so.* > /dev/null 2>&1; then
+            if [[ -z "${LD_LIBRARY_PATH-}" ]]; then
+                LD_LIBRARY_PATH="$dir"
+            else
+                LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH"
+            fi
+        fi
+    done < <(find "$SCORE_SUPPORT_DIR" -mindepth 1 -type d -print0)
+fi
+
+export LD_LIBRARY_PATH="${APPIMAGE_LIBRARY_PATH}:${APPDIR}/usr/lib:${LD_LIBRARY_PATH}"
+
+"${APPDIR}/usr/bin/linuxcheck" "${APPDIR}/usr/bin/ossia-score" "$@"
+
+APP_SUFFIX=""
+
+for arg in "$@"; do
+  case "$arg" in
+    --platform=cli)
+      APP_SUFFIX=-cli
+      ;;
+    --platform=x11)
+      APP_SUFFIX=-x11
+      ;;
+    --platform=wayland)
+      APP_SUFFIX=-wayland
+      ;;
+    --platform=eglfs)
+      APP_SUFFIX=-eglfs
+      ;;
+    --platform=vkkhrdisplay)
+      APP_SUFFIX=-vkkhrdisplay
+      ;;
+    --platform=vnc)
+      APP_SUFFIX=-vnc
+      ;;
+    --platform=vstpuppet)
+      APP_SUFFIX=-vstpuppet
+      ;;
+    --platform=vst3puppet)
+      APP_SUFFIX=-vst3puppet
+      ;;
+    --platform=clappuppet)
+      APP_SUFFIX=-clappuppet
+      ;;
+    --platform=help)
+      echo "Valid options for --platform: cli, x11, wayland, eglfs, vkkhrdisplay, vnc"
+      exit 1
+      ;;
+  esac
+done
+exec "${APPDIR}/usr/bin/ossia-score${APP_SUFFIX}" "$@"

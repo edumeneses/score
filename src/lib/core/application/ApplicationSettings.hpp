@@ -1,0 +1,60 @@
+#pragma once
+#include <score/tools/Version.hpp>
+
+#include <QStringList>
+
+#include <score_lib_base_export.h>
+namespace score
+{
+/**
+ * @brief Load-time settings
+ *
+ * Core application settings that are set on the command line.
+ * The actual options names are given in the ApplicationSettings::parse
+ * implementation.
+ */
+struct SCORE_LIB_BASE_EXPORT ApplicationSettings
+{
+  //! If true, will ask the user if he wants to restore upon loading.
+  bool tryToRestore = true;
+
+  //! Force restoring last session, mainly useful for debugging
+  bool forceRestore = false;
+
+  //! If true, will show the GUI upon loading.
+  bool gui = true;
+
+  //! If true, try to use opengl for rendering.
+  bool opengl = true;
+
+  //! If true, will start playing after loading the scenarios
+  bool autoplay = false;
+
+  //! GUI will use not pre-rendered pixmaps whenever possible. Pixmaps are faster but looks pixelated when zooming.
+  bool vector_gui = true;
+
+  //! The version of the base score framework's JSON save file.
+  score::Version saveFormatVersion{4};
+
+  //! List of scenarios that should be loaded
+  QStringList loadList;
+
+  //! UI file to be loaded
+  QString ui;
+
+  //! Seconds to wait before playing
+  int waitAfterLoad = 0;
+
+  //! Complete list of arguments passed to parse
+  QStringList arguments;
+
+  //! UI event processing rate in ms (used for plug-in gui updates, etc)
+  int uiEventRate = 64;
+
+  //! Parse the arguments.
+  void parse(QStringList args, int& argc, char** argv);
+};
+
+SCORE_LIB_BASE_EXPORT
+void setQApplicationMetadata();
+}

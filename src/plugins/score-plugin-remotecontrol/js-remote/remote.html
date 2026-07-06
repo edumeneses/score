@@ -1,0 +1,27 @@
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+</head>
+
+<body>
+    <form>
+        IP: <input type="text" id="endpoint" name="endpoint" value="ws://127.0.0.1:10212" style="width: 200px"><br>
+        <input type="button" onclick="connectToWS()" value="Connect" />
+        <br/><br/>
+        <input type="button" onclick="play()" value="Play" />
+        <input type="button" onclick="pause()" value="Pause" />
+        <input type="button" onclick="stop()" value="Stop" />
+
+        <br/><br/>
+        <label for="transport">Transport</label>
+        <input id="transport" name="transport" type="range" min="0" value="0" max="100000" />
+    </form>
+    <br /><br />
+
+    <div id="buttons"></div>
+
+    <script src="remote.js"></script>
+</body>
+
+</html>

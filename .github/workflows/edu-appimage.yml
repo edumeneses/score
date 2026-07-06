@@ -141,11 +141,61 @@ jobs:
           git submodule update --init --recursive
           echo "::endgroup::"
 
+          # Auto-resolve submodule pointer conflicts. Git only auto-merges the
+          # trivial case (one pointer is an ancestor of the other), so when we
+          # get here the pointers usually diverged: the PR bumped the submodule
+          # and upstream moved it too. Resolution: take the newer commit when
+          # ancestry holds, otherwise merge the two commits inside the
+          # submodule and point the gitlink at the (local) merge result — the
+          # build only needs the worktree, not a pushable commit. Regular file
+          # conflicts and inner-merge conflicts stay hard failures.
+          resolve_submodule_conflicts() {
+            local path ours theirs pick
+            while IFS= read -r path; do
+              [ -n "$path" ] || continue
+              ours=$(git ls-files -u -- "$path" | awk '$1 == "160000" && $3 == 2 { print $2 }')
+              theirs=$(git ls-files -u -- "$path" | awk '$1 == "160000" && $3 == 3 { print $2 }')
+              if [ -z "$ours" ] || [ -z "$theirs" ]; then
+                echo "conflict in '$path' is not a submodule pointer conflict"
+                return 1
+              fi
+              # Both commits must exist locally; the initial submodule update
+              # only fetched the commit recorded on upstream/master. A PR's
+              # pointer may only be reachable from a pull ref on the submodule
+              # repo, hence the second, broader fetch.
+              git -C "$path" fetch --no-tags origin "$ours" "$theirs" 2>/dev/null \
+                || git -C "$path" fetch --no-tags origin \
+                     "+refs/heads/*:refs/remotes/origin/*" \
+                     "+refs/pull/*/head:refs/remotes/origin-pr/*" 2>/dev/null || true
+              if git -C "$path" merge-base --is-ancestor "$ours" "$theirs" 2>/dev/null; then
+                pick=$theirs
+              elif git -C "$path" merge-base --is-ancestor "$theirs" "$ours" 2>/dev/null; then
+                pick=$ours
+              else
+                echo "submodule '$path' diverged (ours=$ours theirs=$theirs); merging inside the submodule"
+                git -C "$path" checkout -q "$ours" 2>/dev/null || return 1
+                if ! git -C "$path" -c user.name=edu-build-ci \
+                       -c user.email=edu-build-ci@users.noreply.github.com \
+                       merge --no-edit "$theirs"; then
+                  git -C "$path" merge --abort || true
+                  echo "submodule '$path': inner merge conflicts too, cannot auto-resolve"
+                  return 1
+                fi
+                pick=$(git -C "$path" rev-parse HEAD)
+              fi
+              echo "submodule '$path': resolving to $pick"
+              git update-index --cacheinfo "160000,$pick,$path" || return 1
+            done < <(git diff --name-only --diff-filter=U)
+            git commit --no-edit
+          }
+
           for R in "${MERGE_REFS[@]:-}"; do
             [ -n "$R" ] || continue
             echo "::group::Merge $R"
             if git merge --no-edit "$R"; then
               echo "merged $R"
+            elif resolve_submodule_conflicts; then
+              echo "merged $R (auto-resolved submodule pointer conflict)"
             else
               echo "::error::Merge conflict on '$R'. Aborting (fail-fast). Rebase that PR on upstream/master and retry."
               git merge --abort || true

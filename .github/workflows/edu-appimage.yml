@@ -45,6 +45,11 @@ env:
   CPU_ARCH: x86_64
   OUT_NAME: ossia.score-master-linux-x86_64-edu.AppImage
   STATE_NAME: edu-build-state.txt
+  # >>> sherpa-plugins injection — REMOVE this block AND the "Inject sherpa-plugins"
+  #     step below once upstream score ships sherpa-plugins in src/addons/. <<<
+  SHERPA_ADDON_REPO: sat-mtl/sherpa-plugins
+  SHERPA_ADDON_REF: main
+  SHERPA_ONNX_VERSION: "1.13.3"   # matches addon vendored header + its prebuilt-v<ver> release
 
 jobs:
   edu-appimage:
@@ -204,6 +209,34 @@ jobs:
             echo "::endgroup::"
           done
           git submodule update --init --recursive
+
+      # >>> sherpa-plugins injection — REMOVE this whole step (and the env block
+      #     above) once upstream score ships sherpa-plugins in src/addons/.
+      #     score globs src/addons/*, so cloning the addon there compiles it into
+      #     the build. The addon vendors its sherpa-onnx headers, so nothing extra
+      #     is needed to COMPILE. The deploy build is STATIC (cninja default →
+      #     SCORE_STATIC_PLUGINS), so the sherpa objects live in the ossia-score
+      #     binary and dlopen libsherpa-onnx-c-api.so from get_module_folder() =
+      #     the binary's dir (usr/bin). So we bundle the prebuilt C-API .so into
+      #     usr/bin just before appimagetool packs the AppDir (libonnxruntime is
+      #     found beside it via that lib's own $ORIGIN rpath).
+      - name: Inject sherpa-plugins addon (temporary)
+        if: steps.integrate.outputs.skip != 'true'
+        run: |
+          set -euxo pipefail
+          # 1. addon source into the globbed addons dir
+          git clone --depth 1 --branch "$SHERPA_ADDON_REF" \
+            "https://github.com/${SHERPA_ADDON_REPO}.git" src/addons/sherpa-plugins
+          rm -rf src/addons/sherpa-plugins/.git
+          # 2. prebuilt C-API runtime libs (for packaging only, not compilation)
+          curl -fL --retry 3 -o "$RUNNER_TEMP/sherpa-cabi.tgz" \
+            "https://github.com/${SHERPA_ADDON_REPO}/releases/download/prebuilt-v${SHERPA_ONNX_VERSION}/sherpa-onnx-cabi-linux-x64.tar.gz"
+          mkdir -p "$RUNNER_TEMP/sherpa-cabi"
+          tar xzf "$RUNNER_TEMP/sherpa-cabi.tgz" -C "$RUNNER_TEMP/sherpa-cabi"
+          # 3. patch the (ephemeral) recipe to drop the libs into usr/bin pre-pack
+          sed -i '\%^\./appimagetool%i cp -v '"$RUNNER_TEMP"'/sherpa-cabi/lib/*.so build/score.AppDir/usr/bin/' \
+            ci/appimage.build.sh
+      # <<< sherpa-plugins injection <<<
 
       - name: Dependencies
         if: steps.integrate.outputs.skip != 'true'

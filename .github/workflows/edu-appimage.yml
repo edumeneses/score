@@ -13,7 +13,13 @@ name: edu AppImage
 #
 # Modes (branch_filter):
 #   open-prs (default) -> branches that are head of an open PR I opened to ossia/score
+#                         (drafts included: `gh pr list --state open` lists them)
 #   all                -> every origin/edu/* branch on this fork (local WIP testing)
+#
+# Conflicts (on_conflict):
+#   skip (default) -> a PR that no longer merges onto upstream/master is left out
+#                     of this build, with a warning; the release body says which.
+#   fail           -> the old fail-fast behaviour: abort the whole build.
 
 on:
   workflow_dispatch:
@@ -29,6 +35,13 @@ on:
         description: "Rebuild even if nothing changed"
         type: boolean
         default: false
+      on_conflict:
+        description: "A PR that conflicts with upstream/master"
+        type: choice
+        default: skip
+        options:
+          - skip   # leave it out of this build, keep going
+          - fail   # abort the whole build (fail-fast)
   schedule:
     - cron: '0 */3 * * *'   # every 3h; skips quickly when nothing changed
 
@@ -45,6 +58,7 @@ env:
   CPU_ARCH: x86_64
   OUT_NAME: ossia.score-master-linux-x86_64-edu.AppImage
   STATE_NAME: edu-build-state.txt
+  SUMMARY_NAME: edu-build-summary.md
   # >>> sherpa-plugins injection — REMOVE this block AND the "Inject sherpa-plugins"
   #     step below once upstream score ships sherpa-plugins in src/addons/. <<<
   SHERPA_ADDON_REPO: sat-mtl/sherpa-plugins
@@ -69,6 +83,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BRANCH_FILTER: ${{ inputs.branch_filter || 'open-prs' }}
           FORCE: ${{ inputs.force || 'false' }}
+          ON_CONFLICT: ${{ inputs.on_conflict || 'skip' }}
         run: |
           set -euo pipefail
           git config user.name  "edu-build-ci"
@@ -194,21 +209,57 @@ jobs:
             git commit --no-edit
           }
 
+          declare -a MERGED=() SKIPPED=()
           for R in "${MERGE_REFS[@]:-}"; do
             [ -n "$R" ] || continue
             echo "::group::Merge $R"
             if git merge --no-edit "$R"; then
               echo "merged $R"
+              MERGED+=("$R")
             elif resolve_submodule_conflicts; then
               echo "merged $R (auto-resolved submodule pointer conflict)"
-            else
-              echo "::error::Merge conflict on '$R'. Aborting (fail-fast). Rebase that PR on upstream/master and retry."
+              MERGED+=("$R")
+            elif [ "$ON_CONFLICT" = "fail" ]; then
+              echo "::error::Merge conflict on '$R'. Aborting (on_conflict=fail). Rebase that PR on upstream/master and retry."
               git merge --abort || true
               exit 1
+            else
+              echo "::warning::Merge conflict on '$R'; left out of this build (on_conflict=skip). Rebase that PR on upstream/master to get it back in."
+              git merge --abort || true
+              SKIPPED+=("$R")
             fi
             echo "::endgroup::"
           done
           git submodule update --init --recursive
+
+          # --- Summary for the release body ---------------------------------------
+          describe_ref() {
+            # pr/<N> -> "#N title (draft)" ; anything else -> the ref name
+            local R=$1
+            if [[ "$R" =~ ^pr/([0-9]+)$ ]]; then
+              local N=${BASH_REMATCH[1]}
+              gh pr view "$N" --repo "$UPSTREAM" --json title,isDraft \
+                -q '"#'"$N"' \(.title)" + (if .isDraft then " (draft)" else "" end)' \
+                || echo "#$N"
+            else
+              echo "$R"
+            fi
+          }
+          {
+            echo "Personal integration build of ossia score: latest upstream/master + my open-PR branches (drafts included). Linux x86_64 only. Auto-rebuilt on change."
+            echo
+            echo "upstream/master: \`$(git rev-parse --short upstream/master)\`"
+            echo
+            echo "Merged:"
+            for R in "${MERGED[@]:-}"; do [ -n "$R" ] && echo "- $(describe_ref "$R") (\`$(git rev-parse --short "$R")\`)"; done
+            [ ${#MERGED[@]} -gt 0 ] || echo "- (none)"
+            if [ ${#SKIPPED[@]} -gt 0 ]; then
+              echo
+              echo "Left out, conflict with upstream/master (rebase to get them back in):"
+              for R in "${SKIPPED[@]}"; do echo "- $(describe_ref "$R")"; done
+            fi
+          } > "$RUNNER_TEMP/$SUMMARY_NAME"
+          cat "$RUNNER_TEMP/$SUMMARY_NAME"
 
       # >>> sherpa-plugins injection — REMOVE this whole step (and the env block
       #     above) once upstream score ships sherpa-plugins in src/addons/.
@@ -255,6 +306,7 @@ jobs:
           mkdir -p staging
           mv "Score.AppImage" "staging/${OUT_NAME}"
           cp "$RUNNER_TEMP/${STATE_NAME}" "staging/${STATE_NAME}"
+          cp "$RUNNER_TEMP/${SUMMARY_NAME}" "staging/${SUMMARY_NAME}"
 
       - name: Upload artifact
         if: steps.integrate.outputs.skip != 'true'
@@ -269,7 +321,7 @@ jobs:
         with:
           tag_name: edu-build
           name: "edu custom build"
-          body: "Personal integration build of ossia score: latest upstream/master + my open-PR branches. Linux x86_64 only. Auto-rebuilt on change."
+          body_path: staging/${{ env.SUMMARY_NAME }}
           append_body: false
           generate_release_notes: false
           files: |

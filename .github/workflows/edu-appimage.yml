@@ -16,6 +16,13 @@ name: edu AppImage
 #                         (drafts included: `gh pr list --state open` lists them)
 #   all                -> every origin/edu/* branch on this fork (local WIP testing)
 #
+# Add-ons: in open-prs mode, my open PRs on score add-on repositories (owners in
+# ADDON_OWNERS; a repo counts as an add-on if it has an addon.json or score's
+# ci/common.deps.sh clones it) are merged too. Each such add-on is cloned from
+# its default branch into src/addons/<repo> after score's own add-on clones,
+# and the PRs are merged onto it; a conflicting add-on PR is skipped the same
+# way as a score PR.
+#
 # Conflicts (on_conflict):
 #   skip (default) -> a PR that no longer merges onto upstream/master is left out
 #                     of this build, with a warning; the release body says which.
@@ -59,6 +66,8 @@ env:
   OUT_NAME: ossia.score-master-linux-x86_64-edu.AppImage
   STATE_NAME: edu-build-state.txt
   SUMMARY_NAME: edu-build-summary.md
+  ADDON_OWNERS: ossia
+  ADDON_PRS_NAME: edu-build-addon-prs.txt
   # >>> sherpa-plugins injection — REMOVE this block AND the "Inject sherpa-plugins"
   #     step below once upstream score ships sherpa-plugins in src/addons/. <<<
   SHERPA_ADDON_REPO: sat-mtl/sherpa-plugins
@@ -124,6 +133,32 @@ jobs:
           echo "merge refs (${#MERGE_REFS[@]}): ${MERGE_REFS[*]:-(none)}"
           echo "::endgroup::"
 
+          # --- Resolve add-on PRs ---------------------------------------------
+          # One line per PR: "<owner/repo> <number> <head sha>", merged later,
+          # after score's own add-on clones (Merge open add-on PRs step).
+          echo "::group::Resolve add-on PRs (owners: $ADDON_OWNERS)"
+          : > "$RUNNER_TEMP/$ADDON_PRS_NAME"
+          if [ "$BRANCH_FILTER" != "all" ]; then
+            OWNER_ARGS=()
+            for O in $ADDON_OWNERS; do OWNER_ARGS+=(--owner "$O"); done
+            DEPS=$(git show upstream/master:ci/common.deps.sh)
+            while read -r REPO NUM; do
+              [ -n "$REPO" ] || continue
+              [ "$REPO" = "$UPSTREAM" ] && continue
+              if ! grep -q "github.com/${REPO}\b" <<<"$DEPS" \
+                 && ! gh api "repos/${REPO}/contents/addon.json" --silent 2>/dev/null; then
+                echo "skip ${REPO}#${NUM}: not a score add-on"
+                continue
+              fi
+              SHA=$(gh pr view "$NUM" --repo "$REPO" --json headRefOid -q .headRefOid)
+              echo "${REPO} ${NUM} ${SHA}" >> "$RUNNER_TEMP/$ADDON_PRS_NAME"
+            done < <(gh search prs --author edumeneses --state open "${OWNER_ARGS[@]}" \
+                       --limit 200 --json repository,number \
+                       -q '.[] | "\(.repository.nameWithOwner) \(.number)"' | sort -V)
+          fi
+          cat "$RUNNER_TEMP/$ADDON_PRS_NAME"
+          echo "::endgroup::"
+
           # --- Change detection -------------------------------------------------
           echo "::group::Compute build state"
           {
@@ -133,6 +168,9 @@ jobs:
               [ -n "$R" ] || continue
               echo "${R}=$(git rev-parse "$R")"
             done
+            while read -r REPO NUM SHA; do
+              [ -n "$REPO" ] && echo "addon:${REPO}#${NUM}=${SHA}"
+            done < "$RUNNER_TEMP/$ADDON_PRS_NAME"
           } | sort > "$RUNNER_TEMP/new-state.txt"
           NEW_HASH=$(sha256sum "$RUNNER_TEMP/new-state.txt" | cut -d' ' -f1)
           echo "new state hash: $NEW_HASH"
@@ -292,6 +330,61 @@ jobs:
       - name: Dependencies
         if: steps.integrate.outputs.skip != 'true'
         run: ./ci/appimage.deps.sh
+
+      # After Dependencies: ci/common.deps.sh clones score's add-ons there and
+      # checks out their pinned refs, which would override an earlier checkout.
+      - name: Merge open add-on PRs
+        if: steps.integrate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          declare -a MERGED=() SKIPPED=() PREPARED=()
+          while read -r REPO NUM SHA; do
+            [ -n "$REPO" ] || continue
+            DIR="src/addons/${REPO##*/}"
+            if [[ " ${PREPARED[*]:-} " != *" ${REPO} "* ]]; then
+              echo "::group::Clone ${REPO}"
+              sudo rm -rf "$DIR"
+              git clone --recursive -j16 "https://github.com/${REPO}.git" "$DIR"
+              PREPARED+=("$REPO")
+              echo "::endgroup::"
+            fi
+            echo "::group::Merge ${REPO}#${NUM}"
+            git -C "$DIR" fetch --no-tags origin "refs/pull/${NUM}/head:refs/remotes/pr/${NUM}"
+            if git -C "$DIR" -c user.name=edu-build-ci \
+                 -c user.email=edu-build-ci@users.noreply.github.com \
+                 merge --no-edit "pr/${NUM}"; then
+              MERGED+=("${REPO}#${NUM}")
+            else
+              echo "::warning::Merge conflict on ${REPO}#${NUM}; left out of this build."
+              git -C "$DIR" merge --abort || true
+              SKIPPED+=("${REPO}#${NUM}")
+            fi
+            git -C "$DIR" submodule update --init --recursive
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/$ADDON_PRS_NAME"
+
+          describe() {
+            local REPO=${1%#*} NUM=${1##*#}
+            gh pr view "$NUM" --repo "$REPO" --json title,isDraft \
+              -q '"'"${REPO}#${NUM}"' \(.title)" + (if .isDraft then " (draft)" else "" end)' \
+              || echo "$1"
+          }
+          if [ ${#MERGED[@]} -gt 0 ] || [ ${#SKIPPED[@]} -gt 0 ]; then
+            {
+              echo
+              echo "Add-on PRs merged:"
+              for P in "${MERGED[@]:-}"; do [ -n "$P" ] && echo "- $(describe "$P")"; done
+              [ ${#MERGED[@]} -gt 0 ] || echo "- (none)"
+              if [ ${#SKIPPED[@]} -gt 0 ]; then
+                echo
+                echo "Add-on PRs left out, conflict with the add-on's default branch:"
+                for P in "${SKIPPED[@]}"; do echo "- $(describe "$P")"; done
+              fi
+            } >> "$RUNNER_TEMP/$SUMMARY_NAME"
+          fi
+          cat "$RUNNER_TEMP/$SUMMARY_NAME"
 
       - name: Build
         if: steps.integrate.outputs.skip != 'true'

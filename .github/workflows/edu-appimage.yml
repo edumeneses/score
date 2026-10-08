@@ -14,7 +14,13 @@ name: edu AppImage
 # Modes (branch_filter):
 #   open-prs (default) -> branches that are head of an open PR I opened to ossia/score
 #                         (drafts included: `gh pr list --state open` lists them)
+#                         + the PRs of others listed in EXTRA_PRS, while they are open
 #   all                -> every origin/edu/* branch on this fork (local WIP testing)
+#
+# Extra PRs: EXTRA_PRS lists PRs of other authors on ossia/score to merge too,
+# in open-prs mode. Each one goes in only while it is open: once merged (or
+# closed) it drops out of the build by itself, and a merged one is in
+# upstream/master anyway. Clean the number out of the list at leisure.
 #
 # Add-ons: in open-prs mode, my open PRs on score add-on repositories (owners in
 # ADDON_OWNERS; a repo counts as an add-on if it has an addon.json or score's
@@ -68,6 +74,9 @@ env:
   SUMMARY_NAME: edu-build-summary.md
   ADDON_OWNERS: ossia
   ADDON_PRS_NAME: edu-build-addon-prs.txt
+  # Space-separated PR numbers on ossia/score by other authors, merged while open.
+  #   2302: jcelerier's mixer console + execution telemetry
+  EXTRA_PRS: "2302"
   # >>> sherpa-plugins injection — REMOVE this block AND the "Inject sherpa-plugins"
   #     step below once upstream score ships sherpa-plugins in src/addons/. <<<
   SHERPA_ADDON_REPO: sat-mtl/sherpa-plugins
@@ -121,9 +130,21 @@ jobs:
             # exposes every PR at refs/pull/<N>/head regardless of where the head
             # branch lives (an upstream branch or a fork), so a number-based
             # fetch is robust. Merge in ascending PR-number order.
-            mapfile -t PRS < <(gh pr list --repo "$UPSTREAM" --state open \
-                --author edumeneses --limit 300 --json number -q '.[].number' \
-                | sort -n)
+            mapfile -t MINE < <(gh pr list --repo "$UPSTREAM" --state open \
+                --author edumeneses --limit 300 --json number -q '.[].number')
+            # Others' PRs from EXTRA_PRS, only while open.
+            declare -a EXTRA=()
+            for P in $EXTRA_PRS; do
+              STATE=$(gh pr view "$P" --repo "$UPSTREAM" --json state -q .state) \
+                || STATE=UNKNOWN
+              if [ "$STATE" = "OPEN" ]; then
+                EXTRA+=("$P")
+              else
+                echo "::notice::EXTRA_PRS: #$P is ${STATE,,}, left out (remove it from EXTRA_PRS)"
+              fi
+            done
+            mapfile -t PRS < <(printf '%s\n' "${MINE[@]:-}" "${EXTRA[@]:-}" \
+                | grep -E '^[0-9]+$' | sort -nu)
             for P in "${PRS[@]:-}"; do
               [ -n "$P" ] || continue
               git fetch --no-tags upstream "refs/pull/${P}/head:refs/remotes/pr/${P}"
@@ -272,19 +293,23 @@ jobs:
 
           # --- Summary for the release body ---------------------------------------
           describe_ref() {
-            # pr/<N> -> "#N title (draft)" ; anything else -> the ref name
+            # pr/<N> -> "#N title (by author) (draft)" ; anything else -> the ref name.
+            # The author is named only for others' PRs, without an @ so the
+            # release does not mention them.
             local R=$1
             if [[ "$R" =~ ^pr/([0-9]+)$ ]]; then
               local N=${BASH_REMATCH[1]}
-              gh pr view "$N" --repo "$UPSTREAM" --json title,isDraft \
-                -q '"#'"$N"' \(.title)" + (if .isDraft then " (draft)" else "" end)' \
+              gh pr view "$N" --repo "$UPSTREAM" --json title,isDraft,author \
+                -q '"#'"$N"' \(.title)"
+                    + (if .author.login != "edumeneses" then " (by \(.author.login))" else "" end)
+                    + (if .isDraft then " (draft)" else "" end)' \
                 || echo "#$N"
             else
               echo "$R"
             fi
           }
           {
-            echo "Personal integration build of ossia score: latest upstream/master + my open-PR branches (drafts included). Linux x86_64 only. Auto-rebuilt on change."
+            echo "Personal integration build of ossia score: latest upstream/master + my open-PR branches (drafts included) + the open PRs of others listed in EXTRA_PRS. Linux x86_64 only. Auto-rebuilt on change."
             echo
             echo "upstream/master: \`$(git rev-parse --short upstream/master)\`"
             echo

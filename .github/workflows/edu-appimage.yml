@@ -22,6 +22,11 @@ name: edu AppImage
 # closed) it drops out of the build by itself, and a merged one is in
 # upstream/master anyway. Clean the number out of the list at leisure.
 #
+# Held PRs: HOLD_PRS keeps a PR out of the build while a PR it depends on is
+# still unmerged, as "<pr>=<owner/repo>#<n>". Once that one is merged the PR
+# goes in by itself; the release body lists the held ones and what they wait
+# for. For a PR that needs something the build cannot get yet (e.g. a new SDK).
+#
 # Add-ons: in open-prs mode, my open PRs on score add-on repositories (owners in
 # ADDON_OWNERS; a repo counts as an add-on if it has an addon.json or score's
 # ci/common.deps.sh clones it) are merged too. Each such add-on is cloned from
@@ -77,6 +82,10 @@ env:
   # Space-separated PR numbers on ossia/score by other authors, merged while open.
   #   2302: jcelerier's mixer console + execution telemetry
   EXTRA_PRS: "2302"
+  # Space-separated "<pr>=<owner/repo>#<n>": the PR stays out until <n> is merged.
+  #   2176: SDL3 port; the SDK (ci/appimage.deps.sh) has no SDL3 before
+  #         ossia/sdk#27, so the AppImage would build without SDL at all.
+  HOLD_PRS: "2176=ossia/sdk#27"
   # >>> sherpa-plugins injection — REMOVE this block AND the "Inject sherpa-plugins"
   #     step below once upstream score ships sherpa-plugins in src/addons/. <<<
   SHERPA_ADDON_REPO: sat-mtl/sherpa-plugins
@@ -116,7 +125,7 @@ jobs:
           # --- Resolve the merge refs ------------------------------------------
           # MERGE_REFS = local refs to merge onto upstream/master, in order.
           echo "::group::Resolve refs (filter=$BRANCH_FILTER)"
-          declare -a MERGE_REFS=()
+          declare -a MERGE_REFS=() HELD=()
           if [ "$BRANCH_FILTER" = "all" ]; then
             # Every edu/* branch on the fork (origin). Local WIP testing.
             git fetch --no-tags origin "+refs/heads/edu/*:refs/remotes/origin/edu/*" || true
@@ -145,6 +154,18 @@ jobs:
             done
             mapfile -t PRS < <(printf '%s\n' "${MINE[@]:-}" "${EXTRA[@]:-}" \
                 | grep -E '^[0-9]+$' | sort -nu)
+            # HOLD_PRS: out while the PR they wait for is unmerged.
+            for H in $HOLD_PRS; do
+              P=${H%%=*} DEP=${H#*=}
+              DSTATE=$(gh pr view "${DEP##*#}" --repo "${DEP%#*}" --json state -q .state) \
+                || DSTATE=UNKNOWN
+              if [ "$DSTATE" = "MERGED" ]; then
+                echo "::notice::HOLD_PRS: $DEP is merged, #$P goes in (remove it from HOLD_PRS)"
+              else
+                HELD+=("$P $DEP")
+                mapfile -t PRS < <(printf '%s\n' "${PRS[@]:-}" | grep -vx "$P" || true)
+              fi
+            done
             for P in "${PRS[@]:-}"; do
               [ -n "$P" ] || continue
               git fetch --no-tags upstream "refs/pull/${P}/head:refs/remotes/pr/${P}"
@@ -320,6 +341,11 @@ jobs:
               echo
               echo "Left out, conflict with upstream/master (rebase to get them back in):"
               for R in "${SKIPPED[@]}"; do echo "- $(describe_ref "$R")"; done
+            fi
+            if [ ${#HELD[@]} -gt 0 ]; then
+              echo
+              echo "Held back until the PR they depend on is merged (HOLD_PRS):"
+              for H in "${HELD[@]}"; do echo "- $(describe_ref "pr/${H%% *}"), waits for ${H#* }"; done
             fi
           } > "$RUNNER_TEMP/$SUMMARY_NAME"
           cat "$RUNNER_TEMP/$SUMMARY_NAME"

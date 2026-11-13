@@ -346,9 +346,10 @@ jobs:
           cat "$RUNNER_TEMP/$SUMMARY_NAME"
 
       # The x86_64 AppImage upstream builds on SAT's self-hosted builder; on a
-      # GitHub-hosted runner (4 cores, 16 GB) the unity builds now exceed the
-      # memory and the build is killed (exit 137). Swap on /mnt lets it finish.
-      - name: More swap
+      # GitHub-hosted runner (4 cores, 16 GB, ~14 GB free on /) score no longer
+      # fits: the build was OOM-killed, then the runner stopped answering. So:
+      # swap and the build tree on /mnt, and two compile jobs (see Build).
+      - name: Make room on the runner
         if: steps.integrate.outputs.skip != 'true'
         run: |
           set -eux
@@ -358,6 +359,13 @@ jobs:
           sudo chmod 600 /mnt/swapfile
           sudo mkswap /mnt/swapfile
           sudo swapon /mnt/swapfile
+          sudo mkdir -p /mnt/work
+          sudo chown "$(id -u):$(id -g)" /mnt/work
+          # appimage.build.sh starts the build container without passing the
+          # job count: hand it CMAKE_BUILD_PARALLEL_LEVEL, which cninja's final
+          # `cmake --build .` follows.
+          sed -i 's|^-e CPU_ARCH="\$CPU_ARCH" \\$|&\n-e CMAKE_BUILD_PARALLEL_LEVEL="$CMAKE_BUILD_PARALLEL_LEVEL" \\|' ci/appimage.build.sh
+          grep -n "CMAKE_BUILD_PARALLEL_LEVEL" ci/appimage.build.sh
           free -h
           df -h / /mnt
 
@@ -422,6 +430,9 @@ jobs:
 
       - name: Build
         if: steps.integrate.outputs.skip != 'true'
+        env:
+          BUILD_FOLDER: /mnt/work/build
+          CMAKE_BUILD_PARALLEL_LEVEL: "2"
         run: |
           export GITTAGNOV=master
           ./ci/appimage.build.sh

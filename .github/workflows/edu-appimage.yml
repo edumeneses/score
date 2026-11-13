@@ -345,6 +345,22 @@ jobs:
           } > "$RUNNER_TEMP/$SUMMARY_NAME"
           cat "$RUNNER_TEMP/$SUMMARY_NAME"
 
+      # The x86_64 AppImage upstream builds on SAT's self-hosted builder; on a
+      # GitHub-hosted runner (4 cores, 16 GB) the unity builds now exceed the
+      # memory and the build is killed (exit 137). Swap on /mnt lets it finish.
+      - name: More swap
+        if: steps.integrate.outputs.skip != 'true'
+        run: |
+          set -eux
+          sudo swapoff -a
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 24G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          free -h
+          df -h / /mnt
+
       - name: Dependencies
         if: steps.integrate.outputs.skip != 'true'
         run: ./ci/appimage.deps.sh

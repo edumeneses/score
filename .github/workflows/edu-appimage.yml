@@ -428,45 +428,6 @@ jobs:
           fi
           cat "$RUNNER_TEMP/$SUMMARY_NAME"
 
-      # github.com/microsoft/onnxruntime answers 404 since 2026-11-18, so the
-      # GPU tarball score-addon-onnx downloads is gone. NuGet still carries the
-      # same CUDA 13 build: lay it out like the tarball and hand it to
-      # FetchContent. Does nothing while GitHub serves the tarball.
-      - name: Mirror onnxruntime from NuGet
-        if: steps.integrate.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          CM=src/addons/score-addon-onnx/cmake/onnxruntime.cmake
-          if [ ! -f "$CM" ]; then echo "no score-addon-onnx, nothing to do"; exit 0; fi
-          V=$(sed -n 's/^set(ONNXRUNTIME_VERSION "\([0-9.]*\)")$/\1/p' "$CM" | head -n1)
-          NAME="onnxruntime-linux-x64-gpu_cuda13-${V}"
-          URL="https://github.com/microsoft/onnxruntime/releases/download/v${V}/${NAME}.tgz"
-          if curl -sfIL -o /dev/null "$URL"; then
-            echo "GitHub serves ${NAME}.tgz, the add-on fetches it itself"
-            exit 0
-          fi
-          echo "::warning::${URL} is gone; ${NAME} rebuilt from NuGet Microsoft.ML.OnnxRuntime.Gpu.Linux ${V}"
-          PKG=microsoft.ml.onnxruntime.gpu.linux
-          W="$RUNNER_TEMP/ort"
-          OUT="$PWD/.ort-mirror/${NAME}"
-          rm -rf "$W" "$OUT"
-          mkdir -p "$W" "$OUT/include" "$OUT/lib"
-          curl -sfL --retry 3 -o "$W/ort.nupkg" \
-            "https://api.nuget.org/v3-flatcontainer/${PKG}/${V}/${PKG}.${V}.nupkg"
-          unzip -q "$W/ort.nupkg" 'buildTransitive/native/include/*' 'runtimes/linux-x64/native/*' -d "$W"
-          install -m 644 "$W"/buildTransitive/native/include/*.h "$OUT/include/"
-          install -m 755 "$W/runtimes/linux-x64/native/libonnxruntime.so" "$OUT/lib/libonnxruntime.so.${V}"
-          install -m 755 "$W"/runtimes/linux-x64/native/libonnxruntime_providers_*.so "$OUT/lib/"
-          ln -s "libonnxruntime.so.${V}" "$OUT/lib/libonnxruntime.so.1"
-          ln -s libonnxruntime.so.1 "$OUT/lib/libonnxruntime.so"
-          rm -rf "$W"
-          ls -l "$OUT/lib"
-          echo "SCORE_EXTRA_CMAKE_ARGS=-DFETCHCONTENT_SOURCE_DIR_ONNXRUNTIME=/score/.ort-mirror/${NAME}" >> "$GITHUB_ENV"
-          {
-            echo
-            echo "onnxruntime ${V}: GitHub release gone, taken from NuGet Microsoft.ML.OnnxRuntime.Gpu.Linux ${V}."
-          } >> "$RUNNER_TEMP/$SUMMARY_NAME"
-
       - name: Build
         if: steps.integrate.outputs.skip != 'true'
         env:

@@ -38,6 +38,13 @@ name: edu AppImage
 #   skip (default) -> a PR that no longer merges onto upstream/master is left out
 #                     of this build, with a warning; the release body says which.
 #   fail           -> the old fail-fast behaviour: abort the whole build.
+#
+# Change detection: each run fingerprints upstream/master + every merged PR head
+# + every add-on PR head and builds only if that differs from the last published
+# build. A build that fails after integration records its fingerprint
+# (edu-build-failed-state.txt on the release), and later runs do not retry that
+# same state; anything changing, or a dispatch with force=true, builds again.
+# A run that starts while another builds waits for it instead of cancelling it.
 
 on:
   workflow_dispatch:
@@ -68,7 +75,7 @@ permissions:
 
 concurrency:
   group: edu-appimage
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   UPSTREAM: ossia/score
@@ -76,6 +83,7 @@ env:
   CPU_ARCH: x86_64
   OUT_NAME: ossia.score-master-linux-x86_64-edu.AppImage
   STATE_NAME: edu-build-state.txt
+  FAILED_NAME: edu-build-failed-state.txt
   SUMMARY_NAME: edu-build-summary.md
   ADDON_OWNERS: ossia
   ADDON_PRS_NAME: edu-build-addon-prs.txt
@@ -218,12 +226,27 @@ jobs:
             PREV_HASH=$(sha256sum "$RUNNER_TEMP/$STATE_NAME" | cut -d' ' -f1) || PREV_HASH=""
           fi
           echo "prev state hash: ${PREV_HASH:-(none)}"
+
+          FAILED_HASH=""; FAILED_RUN=""
+          if gh release download edu-build --repo "$FORK" \
+               --pattern "$FAILED_NAME" --dir "$RUNNER_TEMP" --clobber 2>/dev/null; then
+            FAILED_RUN=$(sed -n 's/^failed_run=//p' "$RUNNER_TEMP/$FAILED_NAME")
+            FAILED_HASH=$({ grep -v '^failed_run=' "$RUNNER_TEMP/$FAILED_NAME" || true; } | sha256sum | cut -d' ' -f1)
+          fi
+          echo "failed state hash: ${FAILED_HASH:-(none)}"
           echo "::endgroup::"
 
-          if [ "$NEW_HASH" = "$PREV_HASH" ] && [ "$FORCE" != "true" ]; then
-            echo "No change since last build (and force=false). Skipping build."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          if [ "$FORCE" != "true" ]; then
+            if [ "$NEW_HASH" = "$PREV_HASH" ]; then
+              echo "No change since last build (and force=false). Skipping build."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$NEW_HASH" = "$FAILED_HASH" ]; then
+              echo "::notice::This exact state already failed to build (${FAILED_RUN:-unknown run}). Not retrying until something changes; dispatch with force=true to retry now."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
@@ -465,3 +488,21 @@ jobs:
           files: |
             staging/${{ env.OUT_NAME }}
             staging/${{ env.STATE_NAME }}
+
+      - name: Forget an earlier failed state
+        if: steps.integrate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete-asset edu-build "$FAILED_NAME" --repo "$FORK" --yes 2>/dev/null || true
+
+      - name: Remember the failed state
+        if: failure() && steps.integrate.outcome == 'success' && steps.integrate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          {
+            cat "$RUNNER_TEMP/$STATE_NAME"
+            echo "failed_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "$RUNNER_TEMP/$FAILED_NAME"
+          gh release upload edu-build "$RUNNER_TEMP/$FAILED_NAME" --repo "$FORK" --clobber
